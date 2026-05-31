@@ -1,0 +1,1195 @@
+/**
+ * tab-engine-pane.js — Compact engine analysis pane for the Game tab.
+ *
+ * Renders into #comms-pane-eng (5th comms sub-tab, next to Chat/Seek/Log/Ctrl).
+ *
+ * Features:
+ *   • Compact stats strip (depth · eval · nodes · NPS · confidence)
+ *   • Live search feed table (one row per depth, upserted)
+ *     – Stale rows from the previous search stay dimmed until overwritten
+ *     – Ponder rows shown with a subtle tint
+ *   • Hover a PV cell → board animates the PV line step-by-step
+ *     (calls TabGame.previewPv / TabGame.restoreBoard)
+ */
+'use strict';
+
+const TabEnginePane = (() => {
+  let _rendered    = false;
+  let _gameId      = null;
+
+  // PV grid: _pvGrid[depth][absoluteGamePly] = uciMove
+  // _pvStats[depth] = { evalStr, evalColor, nodesStr, seldepth, isPonder }
+  let _pvGrid      = {};   // accumulated engine predictions across the whole game
+  let _pvStats     = {};   // last stat snapshot per depth row
+  let _numPlyCols  = 0;    // number of PV td columns currently in the DOM
+
+  // Game ID that the current grid data belongs to.
+  // Data is cleared only when this changes (genuine new game), not on game_end
+  // redraws or snapshot DOM rebuilds for the same game.
+  let _dataGameId  = null;
+
+  // Last game object we successfully rendered — lets us refill the pane
+  // even when App.currentGame() momentarily returns null or a different game
+  // during end-of-game transitions.
+  let _lastGame    = null;
+
+  // Depth-loss tracking per history column — locked in permanently once set:
+  //   _wrongDepth[col]   = max depth the engine reached with a wrong prediction
+  //   _depthLost[col]    = wrongDepth[col] - D_recovery
+  //                        D_recovery sampled 1 second after the move, giving
+  //                        the engine time to report its first real depths back.
+  //   _pendingWrong[col] = wrongDepth waiting for the 1s timer to fire
+  let _wrongDepth   = {};
+  let _depthLost    = {};
+  let _pendingWrong = {};
+
+  // Cache: _mdCache[col] = max depth in _pvGrid that has a move for that col.
+  // Cleared whenever _pvGrid is written or wiped.
+  let _mdCache = null;
+
+  // rAF handle for batched redraws — coalesces multiple search_info calls per frame.
+  let _rafId = null;
+
+  // SAN display cache:
+  //   _sanGrid[depth][col] = SAN string for PV moves (computed at upsert time)
+  //   _historySan[col]     = SAN string for each committed history move
+  let _sanGrid    = {};
+  let _historySan = [];
+
+  // Actual-move record per column — one entry per ply, for both sides.
+  //   uci:       the move that was actually played (or live best-move during search)
+  //   san:       SAN string (set for bot moves from search; opponent SAN resolved at render)
+  //   evalColor: hsl(...) color at the moment the move was committed (for background tint)
+  //   depth:     search depth at time of capture (used to prefer highest-depth update)
+  //   frozen:    true once the move is committed; live tentative entries are false
+  //
+  // This cell renders at depth = _maxDepthForCol(col) + 1  — the first empty slot
+  // below each column's deepest engine prediction.  During live search it moves
+  // down naturally as the engine climbs; after the move it stays put permanently.
+  let _actualGrid = {};
+
+  /** Replace piece letter with Unicode chess glyph: N→♘ Q→♕ etc. */
+  function _toGlyph(san) {
+    if (!san) return san;
+    const G = { K:'♔', Q:'♕', R:'♖', B:'♗', N:'♘' };
+    return san.replace(/^([KQRBN])/, (_, p) => G[p] || p);
+  }
+
+  /** Convert raw SAN to plain English, e.g. 'Rxe6+' → 'Rook takes e6 \u2014 Check' */
+  function _describeMove(san) {
+    if (!san) return '';
+    if (san === 'O-O')   return 'Kingside castle';
+    if (san === 'O-O-O') return 'Queenside castle';
+    const PIECE = { K:'King', Q:'Queen', R:'Rook', B:'Bishop', N:'Knight' };
+    const suffix = san.endsWith('#') ? ' \u2014 Checkmate'
+                 : san.endsWith('+') ? ' \u2014 Check' : '';
+    let s = san.replace(/[+#]$/, '');
+    let promo = '';
+    const pm = s.match(/=([QRBN])$/);
+    if (pm) { promo = `, promotes to ${PIECE[pm[1]]}`; s = s.slice(0, s.lastIndexOf('=')); }
+    const pieceChar = PIECE[s[0]] ? s[0] : null;
+    const pieceName = pieceChar ? PIECE[pieceChar] : 'Pawn';
+    let rest = pieceChar ? s.slice(1) : s;
+    const isCapture = rest.includes('x');
+    rest = rest.replace('x', '');
+    const dest = rest.slice(-2);
+    return `${pieceName} ${isCapture ? 'takes' : 'to'} ${dest}${promo}${suffix}`;
+  }
+
+  /** Format milliseconds as a human-readable duration, e.g. 1700 → '1.7s' */
+  function _fmtMs(ms) {
+    if (!ms) return null;
+    if (ms >= 60000) return (ms / 60000).toFixed(1) + 'm';
+    if (ms >=  1000) return (ms / 1000).toFixed(1) + 's';
+    return ms + 'ms';
+  }
+
+  /** Format eval as a number + label for tooltips, e.g. '+1.40 (Advantage)' */
+  function _fmtEvalTip(cp, mate) {
+    if (mate != null)
+      return mate > 0 ? `Mate in ${mate}` : `Mated in ${Math.abs(mate)}`;
+    if (cp == null) return null;
+    const v  = cp / 100;
+    const sign = v >= 0 ? '+' : '';
+    const abs = Math.abs(cp);
+    const label = abs <  10 ? 'Equal'
+                : abs <  50 ? (cp > 0 ? 'Slight edge'   : 'Slight deficit')
+                : abs < 150 ? (cp > 0 ? 'Edge'          : 'Deficit')
+                : abs < 300 ? (cp > 0 ? 'Advantage'     : 'Disadvantage')
+                : abs < 600 ? (cp > 0 ? 'Winning'       : 'Losing')
+                :             (cp > 0 ? 'Decisive'      : 'Lost');
+    return `${sign}${v.toFixed(2)} (${label})`;
+  }
+
+  const pane       = () => document.getElementById('comms-pane-eng');
+  const UCI_RE     = /^[a-h][1-8][a-h][1-8][qrbnQRBN]?$/;
+  const PLY_W      = 44;   // px, fixed width per ply column
+  const PLY_LOOKAHEAD = 10; // extra columns rendered beyond the deepest filled cell
+
+  const _DEBUG = true;
+  function _dbg(msg, ...rest) {
+    if (!_DEBUG) return;
+    const ts = performance.now().toFixed(1).padStart(9);
+    const dataStr = rest.length
+      ? ' ' + rest.map(x => typeof x === 'object' && x !== null
+          ? JSON.stringify(x).slice(0, 120) : String(x)).join(' ')
+      : '';
+    console.log(`%c[ep ${ts}ms]%c ${msg}${dataStr}`, 'color:#6af;font-weight:600', 'color:#adf');
+  }
+  function _warn(msg, ...rest) {
+    const ts = performance.now().toFixed(1).padStart(9);
+    const dataStr = rest.length
+      ? ' ' + rest.map(x => typeof x === 'object' && x !== null
+          ? JSON.stringify(x).slice(0, 120) : String(x)).join(' ')
+      : '';
+    console.warn(`%c[ep ${ts}ms]%c ${msg}${dataStr}`, 'color:#fa4;font-weight:600', 'color:#fd9');
+  }
+
+  /* ── lifecycle ──────────────────────────────────────────────────── */
+
+  function show() {
+    const g = App.currentGame();
+    const paneEmpty = !document.getElementById('ep-tbody');
+    _dbg(`show()  g=${g?.id ?? 'null'}(${g?.status})  _gameId=${_gameId}  _dataGameId=${_dataGameId}  _rendered=${_rendered}  paneEmpty=${paneEmpty}`);
+    if (!g) {
+      if (_dataGameId !== null) {
+        if ((!_rendered || paneEmpty) && _lastGame) {
+          _dbg('show() no g but _dataGameId set — refilling from _lastGame ' + _lastGame.id + (paneEmpty ? ' (paneEmpty!)' : ''));
+          _fullRender(_lastGame);
+        }
+        return;
+      }
+      _dbg('show() no g, no prior data — showing empty state');
+      const p = pane();
+      if (p) p.innerHTML = '<div class="ep-empty">No active game</div>';
+      _rendered = false;
+      return;
+    }
+    if (g.id !== _gameId) {
+      _dbg(`show() game ID changed ${_gameId} → ${g.id} — invalidating render`);
+      _gameId = g.id; _rendered = false;
+    }
+    // Even if _rendered=true, re-render if the DOM was wiped externally
+    if (!_rendered || paneEmpty) {
+      if (paneEmpty && _rendered) _warn('show() pane was wiped externally while _rendered=true — forcing re-render');
+      _fullRender(g);
+    } else {
+      _updateStats(g);
+    }
+  }
+
+  function onEvent(type, data) {
+    // For game_end we may be called right after tab-game wiped the DOM, so
+    // App.currentGame() might transiently return null or a stale value.
+    // Prefer the live game, but fall back to _lastGame for end-of-game events.
+    let g = App.currentGame();
+    if (!g && (type === 'game_end' || type === 'snapshot')) g = _lastGame;
+    _dbg(`onEvent(${type})  g=${g?.id ?? 'null'}(${g?.status})  _gameId=${_gameId}  _dataGameId=${_dataGameId}  _rendered=${_rendered}`);
+    if (!g) { _warn(`onEvent(${type}) — no game, ignoring`); return; }
+    if (g.id !== _gameId) {
+      _dbg(`onEvent game ID changed ${_gameId} → ${g.id}`);
+      _gameId = g.id; _rendered = false;
+    }
+
+    // On game boundary events, re-render preserving existing analysis data.
+    // (tab-game._fullRender wipes #comms-pane-eng; we need to refill it.)
+    if (type === 'snapshot') {
+      _dbg('onEvent → snapshot — refilling DOM');
+      _rendered = false;
+      _fullRender(g, /*preserveData=*/true);
+      const postCheck = !document.getElementById('ep-tbody');
+      if (postCheck) _warn('snapshot _fullRender completed but #ep-tbody still missing!');
+      return;
+    }
+
+    if (type === 'game_end') {
+      _dbg('onEvent → game_end — refilling DOM, preserving data');
+      _rendered = false;
+      _fullRender(g, /*preserveData=*/true);
+      const postCheck2 = !document.getElementById('ep-tbody');
+      if (postCheck2) _warn('game_end _fullRender completed but #ep-tbody still missing!');
+      return;
+    }
+
+    // --- Guard: ignore all engine events for a finished game. ---------------
+    // After game_end, the engine may fire search_start/search_info for its
+    // cleanup search (or immediately for the next game's ponder).  Processing
+    // these would wipe _pvStats and overwrite the clean post-game display.
+    if (g.status === 'finished' && g.id === _dataGameId) {
+      _dbg(`onEvent(${type}) — game is finished, ignoring engine event`);
+      return;
+    }
+
+    // Ensure the pane is rendered even if the user hasn't visited the Eng tab yet.
+    if (!_rendered) {
+      _dbg('onEvent — pane not rendered, calling _fullRender');
+      _fullRender(g);
+    }
+
+    switch (type) {
+      case 'search_start': {
+        const gPly = g.fullMoves?.length ?? 0;
+        _dbg('search_start  gPly=' + gPly);
+        _wipeFuture(gPly);
+        _pvStats = {}; // clear stale Sel/Eval/Nodes from previous search
+        _redrawAllRows(g);
+        _updateStats(g);
+        break;
+      }
+      case 'search_info': {
+        _upsertRow(data);
+        _updateStats(g);
+        break; // _upsertRow already calls _scheduleRedraw internally
+      }
+      case 'move':
+      case 'opponent_move': {
+        const gPly = g.fullMoves?.length ?? 0;
+        _dbg(type + '  gPly=' + gPly, data);
+        const newCol = gPly - 1;
+        if (newCol >= 0) {
+          // Helper: best eval snapshot from _pvStats (returns {evalColor,cp,mate})
+          const _pickEval = (allowPonder) => {
+            const ds = Object.keys(_pvStats).map(Number)
+              .filter(d => allowPonder || !_pvStats[d]?.isPonder);
+            if (!ds.length) return {};
+            const st = _pvStats[Math.max(...ds)];
+            const ec = st?.evalColor;
+            return {
+              evalColor: (ec && !ec.startsWith('var(')) ? ec : null,
+              cp:   st?.cp   ?? null,
+              mate: st?.mate ?? null,
+            };
+          };
+          // Helper: pull nodes/nps/time/seldepth from highest-depth _pvStats entry.
+          const _pickStats = () => {
+            const ds = Object.keys(_pvStats).map(Number);
+            if (!ds.length) return {};
+            const st = _pvStats[Math.max(...ds)];
+            return { nodes: st?.nodes ?? 0, nps: st?.nps ?? 0,
+                     time: st?.time ?? 0, seldepth: st?.seldepth ?? null,
+                     depth: Math.max(...ds) };
+          };
+          if (type === 'move') {
+            const { evalColor: finalColor, cp: finalCp, mate: finalMate } = _pickEval(false);
+            if (_actualGrid[newCol] && !_actualGrid[newCol].frozen) {
+              _actualGrid[newCol] = { ..._actualGrid[newCol],
+                evalColor: finalColor ?? _actualGrid[newCol].evalColor,
+                cp:   finalCp   ?? _actualGrid[newCol].cp,
+                mate: finalMate ?? _actualGrid[newCol].mate, frozen: true };
+            } else if (!_actualGrid[newCol]) {
+              const extra = _pickStats();
+              _actualGrid[newCol] = { uci: g.fullMoves[newCol] ?? null, san: null,
+                evalColor: finalColor, cp: finalCp, mate: finalMate, frozen: true, ...extra };
+            }
+          } else {
+            const { evalColor, cp, mate } = _pickEval(true);
+            const extra = _pickStats();
+            _actualGrid[newCol] = { uci: g.fullMoves[newCol] ?? null, san: null,
+              evalColor, cp, mate, frozen: true, ...extra };
+          }
+        }
+        if (newCol >= 0 && _wrongDepth[newCol] == null) {
+          const actual    = g.fullMoves[newCol] ?? null;
+          const wrongD    = _maxDepthForCol(newCol);
+          const predicted = wrongD >= 0 ? ((_pvGrid[wrongD] || {})[newCol] ?? null) : null;
+          if (actual && predicted && actual !== predicted) {
+            _wrongDepth[newCol]   = wrongD;
+            _pendingWrong[newCol] = wrongD;
+            _dbg('wrong prediction col=' + newCol + '  wrongD=' + wrongD
+              + '  predicted=' + predicted + '  actual=' + actual
+              + '  — locking depthLost in 1s');
+            // Sample D_recovery 1 second later so the engine has had time
+            // to report real search depths rather than always d=1.
+            setTimeout(() => {
+              if (_pendingWrong[newCol] == null) return; // already resolved
+              const g2 = App.currentGame();
+              if (!g2 || g2.id !== _gameId) { delete _pendingWrong[newCol]; return; }
+              // _pvGrid[depth][gPly] = what the engine has explored for our reply
+              const D_recovery = _maxDepthForCol(gPly);
+              const lost       = wrongD - (D_recovery >= 0 ? D_recovery : 0);
+              delete _pendingWrong[newCol];
+              if (lost > 0) {
+                _depthLost[newCol] = lost;
+                _dbg('depthLost locked  col=' + newCol
+                  + '  wrongD=' + wrongD + '  D_recovery=' + D_recovery
+                  + '  lost=' + lost);
+                _redrawAllRows(g2);
+              }
+            }, 300);
+          }
+        }
+        _redrawAllRows(g);
+        _updateStats(g);
+        break;
+      }
+      case 'ponder_start': {
+        const gPly = g.fullMoves?.length ?? 0;
+        _dbg(type + '  gPly=' + gPly);
+        // Wipe stale main-search predictions so the ponder staircase starts clean.
+        //
+        // Ponderhit (ponderMove != null): we know the opponent's move at col gPly,
+        //   so leave that column alone — _upsertRow will fill it immediately.  Wipe
+        //   col >= gPly+1 so the main-search future staircase doesn't block ponder
+        //   data from showing until the search surpasses depth 15+.
+        //
+        // Parent ponder (no ponderMove): opponent not known yet, wipe col >= gPly.
+        const isPonderHitStart = !!g._ponderMoveUci;
+        _wipeFuture(isPonderHitStart ? gPly + 1 : gPly);
+        _pvStats = {};       // clear stale depth stats
+        _redrawAllRows(g);
+        _updateStats(g);
+        break;
+      }
+      case 'ponder_end': {
+        const gPly = g.fullMoves?.length ?? 0;
+        _dbg(type + '  gPly=' + gPly);
+        _redrawAllRows(g);
+        _updateStats(g);
+        break;
+      }
+      case 'search_end':
+        _updateStats(g);
+        break;
+    }
+  }
+
+  /* ── full render ────────────────────────────────────────────────── */
+
+  function _fullRender(g, preserveData = false) {
+    const p = pane();
+    _dbg(`_fullRender(${g.id}, preserveData=${preserveData})  pane=${p ? 'ok' : 'MISSING'}  status=${g.status}`);
+    if (!p) { _warn('_fullRender — #comms-pane-eng not found in DOM, aborting'); return; }
+
+    // Clear all grid data only when a genuinely new game starts (game ID changes).
+    // Re-renders for game_end, snapshot, and other DOM rebuilds within the same
+    // game always preserve the accumulated data so the pane stays readable after
+    // the game finishes.
+    if (_dataGameId !== g.id) {
+      _dbg(`_fullRender WIPE old=${_dataGameId} new=${g.id} — new game, clearing grid`);
+      _pvGrid       = {};
+      _pvStats      = {};
+      _sanGrid      = {};
+      _historySan   = [];
+      _actualGrid   = {};
+      _wrongDepth   = {};
+      _depthLost    = {};
+      _pendingWrong = {};
+      _mdCache      = null;
+      _dataGameId   = g.id;
+    } else {
+      _dbg(`_fullRender PRESERVE data for game ${g.id} (status=${g.status})`);
+    }
+    const gPly  = g.fullMoves?.length ?? 0;
+    _numPlyCols = _neededCols(gPly);
+
+    const plyCells = _plyHeadersHtml(g);
+
+    p.innerHTML = `
+      <div class="ep-stats" id="ep-stats"></div>
+      <div class="ep-table-wrap" id="ep-table-wrap">
+          <table class="ep-table ${g.color === 'white' ? 'ep-bot-white' : 'ep-bot-black'}" id="ep-table">
+          <colgroup>
+            <col id="ep-col-ply-group" span="${_numPlyCols}" class="ep-col-ply">
+            <col id="ep-col-d">
+            <col id="ep-col-sel">
+            <col id="ep-col-eval"  style="width:60px">
+            <col id="ep-col-nodes" style="width:52px">
+          </colgroup>
+          <thead>
+            <tr id="ep-thead-ply">
+              ${plyCells}
+              <th class="ep-th-frozen ep-th-d">D</th>
+              <th class="ep-th-frozen ep-th-sel">Sel</th>
+              <th class="ep-th-frozen ep-th-eval">Eval<div class="ep-col-resize" data-col="ep-col-eval"></div></th>
+              <th class="ep-th-frozen ep-th-nodes">N<div class="ep-col-resize" data-col="ep-col-nodes"></div></th>
+            </tr>
+          </thead>
+          <tbody id="ep-tbody"></tbody>
+        </table>
+      </div>
+      <div id="ep-tip" class="ep-tip" hidden></div>
+    `;
+
+    _rendered = true;
+    _lastGame = g;
+    _dbg(`_fullRender done — #ep-tbody=${!!document.getElementById('ep-tbody')}  #comms-pane-eng.children=${pane()?.children.length ?? 'N/A'}`);
+
+    // Repaint all accumulated rows from _pvGrid into the fresh tbody.
+    // This is essential on preserving re-renders (game_end, snapshot): the tbody
+    // was just wiped by innerHTML=, so every row must be re-inserted even though
+    // _pvGrid still has all the data.  Without this the tbody exists but is empty,
+    // which makes paneEmpty=false (fooling show()) while the table looks blank.
+    _redrawAllRows(g);
+
+    if (g.searchLive) _upsertRow({ ...g.searchLive });
+
+    _updateStats(g);
+    _updateFrozenOffsets();
+    _bindPvHover();
+    _bindResizeHandles();
+  }
+
+  /* ── stats strip ────────────────────────────────────────────────── */
+
+  function _updateStats(g) {
+    const el = document.getElementById('ep-stats');
+    if (!el) return;
+
+    const live  = g.searchLive;
+    const moves = g.moves || [];
+    const isFinished = g.status === 'finished';
+
+    // When the game is finished, derive all display values from the last
+    // _pvStats entry (the deepest depth the engine reached).  This avoids
+    // showing stale/zero values from g.searchLive which is null at game end.
+    if (isFinished) {
+      const ds = Object.keys(_pvStats).map(Number);
+      if (ds.length) {
+        const bestD = Math.max(...ds);
+        const st    = _pvStats[bestD];
+        const evalStr2  = st.evalStr  ?? '\u2013';
+        const evalColor2 = st.evalColor ?? 'var(--muted)';
+        const nodesStr2  = st.nodesStr  ?? '\u2013';
+        const npsStr2    = st.nps ? App.fmtN(st.nps) + '/s' : '\u2013';
+        el.innerHTML = `
+          <div class="ep-stat-row">
+            <span class="ep-stat"><span class="ep-k">D</span><span class="ep-v">${bestD}</span></span>
+            <span class="ep-stat"><span class="ep-k">Eval</span><span class="ep-v" style="color:${evalColor2}">${evalStr2}</span></span>
+            <span class="ep-stat"><span class="ep-k">N</span><span class="ep-v">${nodesStr2}</span></span>
+            <span class="ep-stat"><span class="ep-k">NPS</span><span class="ep-v">${npsStr2}</span></span>
+            <span class="ep-phase ep-phase-idle">done</span>
+          </div>
+        `;
+      } else {
+        el.innerHTML = '<div class="ep-stat-row"><span class="ep-phase ep-phase-idle">done</span></div>';
+      }
+      return;
+    }
+
+    // Depth: from live search-info, else last completed move
+    const depth = live?.depth ?? (moves.length ? moves[moves.length - 1]?.depth : null);
+
+    // Eval: from live, else from last completed move
+    // During ponder, eval_cp is from the opponent's side — negate for display
+    let evalStr  = '–';
+    let evalColor = 'var(--muted)';
+    const src = live ?? (moves.length ? moves[moves.length - 1] : null);
+    if (src) {
+      // Only negate for parent-position ponder ('opponent') where the engine
+      // scores from the opponent's side.  Ponderhit ponder ('ours') and real
+      // searches are already from our perspective.
+      const isPonderSrc = src.ponder === 'opponent';
+      const rawCp   = src.eval_cp ?? null;
+      const dispCp  = rawCp != null ? (isPonderSrc ? -rawCp : rawCp) : null;
+      const rawMate  = src.mate ?? null;
+      const dispMate = rawMate != null ? (isPonderSrc ? -rawMate : rawMate) : null;
+      evalStr  = dispMate != null
+        ? (dispMate > 0 ? `+M${dispMate}` : `-M${Math.abs(dispMate)}`)
+        : dispCp != null ? _fmtEval(dispCp) : '–';
+      evalColor = _evalColor(dispCp, dispMate);
+    }
+
+    const nodes = live?.nodes ?? 0;
+    const nps   = live?.nps   ?? (
+      moves.length
+        ? Math.round(moves.reduce((s, m) => s + (m.nps || 0), 0) / moves.length)
+        : 0
+    );
+
+    const conf      = g.confidence ?? 0;
+    const confPct   = Math.round(conf * 100);
+    const confColor = conf >= 0.8 ? 'var(--green)' : conf >= 0.5 ? 'var(--yellow)' : 'var(--red)';
+
+    // Phase badge
+    let phase = '', phaseCls = '';
+    if (g.status === 'active') {
+      if (live?.ponder)  { phase = 'ponder'; phaseCls = 'ep-phase-ponder'; }
+      else if (live)     { phase = 'search'; phaseCls = 'ep-phase-search'; }
+      else               { phase = 'idle';   phaseCls = 'ep-phase-idle';   }
+    } else if (g.status === 'finished') {
+      phase = 'done'; phaseCls = 'ep-phase-idle';
+    }
+
+    el.innerHTML = `
+      <div class="ep-stat-row">
+        <span class="ep-stat"><span class="ep-k">D</span><span class="ep-v">${depth ?? '–'}</span></span>
+        <span class="ep-stat"><span class="ep-k">Eval</span><span class="ep-v" style="color:${evalColor}">${evalStr}</span></span>
+        <span class="ep-stat"><span class="ep-k">N</span><span class="ep-v">${App.fmtN(nodes)}</span></span>
+        <span class="ep-stat"><span class="ep-k">NPS</span><span class="ep-v">${App.fmtN(nps)}</span></span>
+        <span class="ep-stat ep-stat-conf">
+          <span class="ep-k">Conf</span>
+          <span class="ep-v" style="color:${confColor}">${confPct}%</span>
+          <span class="ep-conf-bar"><span class="ep-conf-fill" style="width:${confPct}%;background:${confColor}"></span></span>
+        </span>
+        ${phase ? `<span class="ep-phase ${phaseCls}">${phase}</span>` : ''}
+      </div>
+    `;
+  }
+
+  /* ── search table ───────────────────────────────────────────────── */
+
+  function _upsertRow(info) {
+    const tbody = document.getElementById('ep-tbody');
+    if (!tbody) return;
+    const g = App.currentGame();
+    if (!g) return;
+
+    const depth    = info.depth ?? 0;
+    // Only negate for parent-position ponder ('opponent') where the engine
+    // scores from the opponent's side.  Ponderhit ponder ('ours') and real
+    // searches are already from our perspective.
+    const isPonder = info.ponder === 'opponent';
+    // fullMoves[i] = UCI string of the i-th half-move played so far
+    const gPly     = g.fullMoves?.length ?? 0;
+
+    const rawCp    = info.eval_cp ?? null;
+    const dispCp   = rawCp != null ? (isPonder ? -rawCp : rawCp) : null;
+    // mate=0 is an artefact of some engines at the root of a ponder; treat as no mate
+    const rawMate  = (info.mate != null && info.mate !== 0) ? info.mate : null;
+    const dispMate = rawMate != null ? (isPonder ? -rawMate : rawMate) : null;
+    const evalStr  = dispMate != null ? (dispMate > 0 ? `+M${dispMate}` : `-M${Math.abs(dispMate)}`)
+                   : dispCp  != null  ? _fmtEval(dispCp) : '–';
+    const evalColor = _evalColor(dispCp, dispMate);
+    const nodesStr  = App.fmtN(info.nodes ?? 0);
+
+    const pvArr   = Array.isArray(info.pv) ? info.pv
+                   : typeof info.pv === 'string' ? info.pv.split(' ').filter(Boolean)
+                   : info.pv0 ? info.pv0.split(' ').filter(Boolean) : [];
+    const pvClean = pvArr.filter(m => UCI_RE.test(m));
+
+    // ── Record into absolute-ply grid ───────────────────────────────
+    // Two ponder modes require different column offsets:
+    //
+    // 'opponent' (parent-position ponder):
+    //   Engine position = [...moves, ourMove] — OPPONENT is to move next.
+    //   pv[0] = opponent's predicted move → col gPly.  No offset.
+    //
+    // 'ours' (ponderhit ponder):
+    //   Engine position = [...moves, ourMove, predictedReply] — WE are to move.
+    //   g.fullMoves only holds moves up to ourMove (predictedReply not yet committed),
+    //   so the engine is one ply ahead of gPly.  pv[0] = our reply → col gPly + 1.
+    //
+    // Normal search: pvOffset = gPly (we are to move at col gPly).
+    const isPonderHit = info.ponder === 'ours';
+    const pvOffset = isPonderHit ? gPly + 1 : gPly;
+    _dbg(`upsert d=${depth} gPly=${gPly} ponder=${info.ponder ?? 'none'} pvOffset=${pvOffset} pv=[${pvClean.join(',')}]`);
+    if (!_pvGrid[depth]) _pvGrid[depth] = {};
+    _mdCache = null; // invalidate after writing to _pvGrid
+    pvClean.forEach((mv, i) => { _pvGrid[depth][pvOffset + i] = mv; });
+
+    // ── Compute SAN for this PV ──────────────────────────────────────
+    // 'ours' (ponderhit): g.fen is the position BEFORE the ponder move (opponent's
+    //   predicted reply not yet in fullMoves).  Prefix the ponder move so SAN is
+    //   computed from the correct post-ponder position.
+    // All other cases: g.fen is exactly the root of the PV.
+    //
+    // For ponderhit we also keep the ponder-move SAN so we can populate col gPly
+    // (the opponent's column) with the known predicted reply throughout the search.
+    const ponderMove    = isPonderHit ? (g._ponderMoveUci ?? null) : null;
+    let   ponderMoveSan = null; // SAN for ponderMove at col gPly (ponderhit only)
+    let sanList = [];
+    if (typeof San !== 'undefined' && pvClean.length > 0) {
+      if (isPonderHit && ponderMove) {
+        const prefixed = San.buildSanList(g.fen, [ponderMove, ...pvClean]);
+        ponderMoveSan = prefixed[0] ?? null;
+        sanList = prefixed.slice(1); // rest of prefixed = SANs for our pv
+      } else {
+        sanList = San.buildSanList(g.fen, pvClean);
+      }
+    }
+    if (!_sanGrid[depth]) _sanGrid[depth] = {};
+    sanList.forEach((s, i) => { _sanGrid[depth][pvOffset + i] = s; });
+
+    // ── For ponderhit: populate the opponent's implicit move at col gPly ─────
+    // The engine is searching from [...moves, ourMove, ponderMove].  ponderMove is
+    // the opponent move we predicted — it is the same at every depth row.  Without
+    // this, col gPly stays blank for the entire ponder search even though we know
+    // exactly what opponent move the whole analysis is conditional on.
+    if (isPonderHit && ponderMove) {
+      _pvGrid[depth][gPly] = ponderMove;
+      if (ponderMoveSan) _sanGrid[depth][gPly] = ponderMoveSan;
+      // Keep a live tentative entry for col gPly (opponent's column) using the
+      // current search eval — the whole analysis is conditional on this move,
+      // so the eval color/value belongs here.  Will be frozen when opponent commits.
+      if (!_actualGrid[gPly]?.frozen) {
+        _actualGrid[gPly] = {
+          uci: ponderMove, san: ponderMoveSan ?? null, evalColor,
+          cp: dispCp, mate: dispMate, depth, frozen: false,
+          nodes: info.nodes ?? 0, nps: info.nps ?? 0,
+          time: info.time ?? 0, seldepth: info.seldepth ?? null,
+        };
+      }
+    }
+
+    // ── Update live tentative for current ply ─────────────────────────
+    // 'ours' ponderhit: our best next move is at gPly+1 (one ahead of gPly).
+    // All other states: gPly (either our normal move, or opponent's predicted move).
+    const tentativeCol = isPonderHit ? gPly + 1 : gPly;
+    if (pvClean.length > 0 && !_actualGrid[tentativeCol]?.frozen) {
+      const existing = _actualGrid[tentativeCol];
+      if (!existing || depth >= (existing.depth ?? 0)) {
+        _actualGrid[tentativeCol] = {
+          uci: pvClean[0], san: sanList[0] ?? null, evalColor,
+          cp: dispCp, mate: dispMate, depth, frozen: false,
+          nodes: info.nodes ?? 0, nps: info.nps ?? 0,
+          time: info.time ?? 0, seldepth: info.seldepth ?? null,
+        };
+      }
+    }
+
+    // ── Backfill skipped depths ──────────────────────────────────────
+    // Engines sometimes skip reporting intermediate depths (e.g. 1→3→4).
+    // They also occasionally emit depth=1 with an empty PV.
+    // For any depth d < current depth that is missing entries, fill in
+    // the first `d` moves of the current PV (only into empty slots).
+    // This keeps the staircase fully populated without overwriting real data.
+    if (pvClean.length > 0) {
+      for (let d = 1; d < depth; d++) {
+        if (!_pvGrid[d]) _pvGrid[d] = {};
+        if (!_sanGrid[d]) _sanGrid[d] = {};
+        for (let i = 0; i < d && i < pvClean.length; i++) {
+          const col = pvOffset + i;
+          if (_pvGrid[d][col] == null) _pvGrid[d][col] = pvClean[i];
+          if (_sanGrid[d][col] == null && sanList[i]) _sanGrid[d][col] = sanList[i];
+        }
+        // Ponderhit: also backfill the known opponent ponder move at col gPly
+        if (isPonderHit && ponderMove) {
+          if (_pvGrid[d][gPly] == null) _pvGrid[d][gPly] = ponderMove;
+          if (_sanGrid[d][gPly] == null && ponderMoveSan) _sanGrid[d][gPly] = ponderMoveSan;
+        }
+      }
+    }
+
+    _pvStats[depth] = { evalStr, evalColor, cp: dispCp, mate: dispMate, nodesStr,
+      seldepth: info.seldepth ?? '–', isPonder,
+      nodes: info.nodes ?? 0, nps: info.nps ?? 0, time: info.time ?? 0 };
+
+    // Grow column span if the PV extends beyond current layout
+    _expandCols(_neededCols(gPly));
+
+    // ── Ensure row exists for the engine depth ──────────────────────
+    _ensureRow(tbody, depth);
+    const tr = tbody.querySelector(`tr[data-depth="${depth}"]`);
+    tr.dataset.pv = pvClean.join(' ');
+    tr.classList.remove('stale');
+    tr.classList.toggle('ep-ponder', isPonder);
+
+    // Batch the full grid redraw through rAF to avoid one DOM update per info line.
+    _scheduleRedraw();
+
+    const wrap = document.getElementById('ep-table-wrap');
+    if (wrap) wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  /* ── PV grid helpers ────────────────────────────────────────────── */
+
+  /** Build single-row ply column headers: piece-color dot + ply number */
+  function _plyHeadersHtml(g) {
+    let cells = '';
+    for (let col = 0; col < _numPlyCols; col++) {
+      const isOurs = _isOurs(g, col);
+      const side   = isOurs ? 'bot' : 'opp';
+      const pc     = (col % 2 === 0) ? 'w' : 'b';
+      cells += `<th class="ep-th-ply ep-th-ply-${side} ep-pc-${pc}" data-ply-col="${col}">` +
+               `<span class="ep-ply-dot"></span>${col + 1}</th>`;
+    }
+    return cells;
+  }
+
+  /** Min column count needed for the current state */
+  function _neededCols(gPly) {
+    let maxCol = gPly + PLY_LOOKAHEAD - 1;
+    for (const cols of Object.values(_pvGrid))
+      for (const c of Object.keys(cols)) maxCol = Math.max(maxCol, +c);
+    return maxCol + 1;
+  }
+
+  /** True if absolute ply `col` is a move played by our bot (not the opponent) */
+  function _isOurs(g, col) {
+    return g.color === 'white' ? (col % 2 === 0) : (col % 2 !== 0);
+  }
+
+  /** Highest search depth that has a prediction for absolute ply `col` */
+  function _maxDepthForCol(col) {
+    if (!_mdCache) {
+      // Build the full cache in one pass over _pvGrid
+      _mdCache = {};
+      for (const [d, cols] of Object.entries(_pvGrid)) {
+        const depth = +d;
+        for (const c of Object.keys(cols)) {
+          const ci = +c;
+          if (cols[ci] != null && ((_mdCache[ci] ?? -1) < depth))
+            _mdCache[ci] = depth;
+        }
+      }
+    }
+    return _mdCache[col] ?? -1;
+  }
+
+  /**
+   * Build the full innerHTML for one depth row.
+   *
+   * Regular cells: engine predictions from _pvGrid (the staircase).
+   *   HISTORY (col < gPly)  — full brightness; wrong-depth red on opponent cols only.
+   *   CURRENT (col == gPly) — same as any filled cell, no special blue.
+   *   FUTURE  (col > gPly)  — dimmed.
+   *
+   * Actual cell: rendered at depth = _maxDepthForCol(col)+1 (first empty slot below the
+   *   staircase).  Shows the move that was actually played (or live best-move during
+   *   search), background-tinted by eval color.  Works for both sides.
+   */
+  function _buildRowCells(g, depth, historySan) {
+    const gPly     = g.fullMoves?.length ?? 0;
+    const depthMap = _pvGrid[depth] || {};
+    const stats    = _pvStats[depth] || {};
+
+    let plyCells = '';
+    for (let col = 0; col < _numPlyCols; col++) {
+      const mv       = depthMap[col] ?? null;
+      const isFuture = col > gPly;
+
+      // ── empty cell ──
+      if (!mv) {
+        // Check if this is the actual-move slot (one below the deepest prediction).
+        // For frozen entries with no pvGrid data (e.g. col wiped after move), use depth 1.
+        const maxD = _maxDepthForCol(col);
+        const act  = _actualGrid[col];
+        const actualDepth = maxD >= 0 ? maxD + 1 : 1;
+        if (act && act.frozen && depth === actualDepth) {
+          const ours = _isOurs(g, col);
+          // Bot moves: use SAN captured at search time; opponent: use historySan
+          const displaySan = _toGlyph((ours ? act.san : historySan?.[col]) ?? act.uci);
+          const { style: evalStyle, cls: evalCls } = _evalCellStyle(act.cp, act.mate, act.frozen);
+          let cls = 'ep-td-ply ep-ply-actual';
+          if (evalCls) cls += ' ' + evalCls;
+          cls += act.frozen ? ' ep-ply-committed' : ' ep-ply-live';
+          cls += ours ? ' ep-ply-us' : ' ep-ply-them';
+          const styleAttr = evalStyle ? ` style="${evalStyle}"` : '';
+          // Tooltip: structured stats card
+          const rawSan  = (ours ? act.san : historySan?.[col]) ?? act.uci;
+          const evalTip = _fmtEvalTip(act.cp, act.mate);
+          const moveLine = _describeMove(rawSan) || (displaySan ?? '');
+          const kv = [];
+          if (act.depth != null)  kv.push(`Depth\t${act.depth}${act.seldepth ? ` · sel ${act.seldepth}` : ''}`);
+          if (evalTip)            kv.push(`Eval\t${evalTip}`);
+          if (act.nodes)          kv.push(`Nodes\t${App.fmtN(act.nodes)}`);
+          if (act.nps)            kv.push(`NPS\t${App.fmtN(act.nps)}/s`);
+          if (act.time)           kv.push(`Time\t${_fmtMs(act.time)}`);
+          let tip = moveLine + (kv.length ? '\n---\n' + kv.join('\n') : '');
+          if (act.frozen && !ours && _wrongDepth[col] != null) {
+            const wD      = _wrongDepth[col];
+            const predUci = ((_pvGrid[wD] || {})[col]);
+            const predRaw = (_sanGrid[wD] || {})[col] ?? predUci ?? '?';
+            tip += `\nPredicted\t${_describeMove(predRaw) || _toGlyph(predRaw)}`;
+          }
+          plyCells += `<td class="${cls}"${styleAttr} data-ep-tip="${App.esc(tip)}">${App.esc(displaySan ?? '')}</td>`;
+          continue;
+        }
+        // Live tentative (not frozen) still needs maxD >= 0
+        if (act && !act.frozen && maxD >= 0 && depth === maxD + 1) {
+          const ours = _isOurs(g, col);
+          // Always prefer act.san — it was computed by San.buildSanList at upsert time
+          // and covers both bot and ponder moves.  historySan[col] is only valid for
+          // committed (frozen) history; the current ply is never in historySan.
+          const displaySan = _toGlyph(act.san ?? act.uci);
+          const isCurrentCol = col === gPly;
+          const { style: evalStyle, cls: evalCls } = _evalCellStyle(act.cp, act.mate, act.frozen, isCurrentCol);
+          let cls = 'ep-td-ply ep-ply-actual ep-ply-live';
+          if (evalCls) cls += ' ' + evalCls;
+          cls += ours ? ' ep-ply-us' : ' ep-ply-them';
+          const styleAttr = evalStyle ? ` style="${evalStyle}"` : '';
+          const rawSan = act.san ?? act.uci;
+          const evalTip = _fmtEvalTip(act.cp, act.mate);
+          const moveLine2 = _describeMove(rawSan) || (displaySan ?? '');
+          const kv2 = [];
+          if (act.depth != null)  kv2.push(`Depth\t${act.depth}${act.seldepth ? ` · sel ${act.seldepth}` : ''}`);
+          if (evalTip)            kv2.push(`Eval\t${evalTip}`);
+          if (act.nodes)          kv2.push(`Nodes\t${App.fmtN(act.nodes)}`);
+          if (act.nps)            kv2.push(`NPS\t${App.fmtN(act.nps)}/s`);
+          if (act.time)           kv2.push(`Time\t${_fmtMs(act.time)}`);
+          const tip = moveLine2 + (kv2.length ? '\n---\n' + kv2.join('\n') : '');
+          plyCells += `<td class="${cls}"${styleAttr} data-ep-tip="${App.esc(tip)}">${App.esc(displaySan ?? '')}</td>`;
+          continue;
+        }
+        let cls = 'ep-td-ply';
+        if (col === gPly && depth < actualDepth) cls += ' ep-ply-current';
+        else if (isFuture) cls += ' ep-ply-future';
+        plyCells += `<td class="${cls}"></td>`;
+        continue;
+      }
+
+      // ── cell with engine prediction ──
+      const ours       = _isOurs(g, col);
+      const isHistory  = col < gPly;
+      const sanDisplay = _toGlyph((_sanGrid[depth] || {})[col] ?? mv);
+      let cls = 'ep-td-ply';
+
+      if (isHistory) {
+        cls += ' ep-ply-committed';
+        cls += ours ? ' ep-ply-us' : ' ep-ply-them';
+        // Wrong-depth red band — opponent moves only (bot choice is in the actual cell)
+        if (!ours) {
+          const wrongD = _wrongDepth[col];
+          const lost   = _depthLost[col];
+          if (wrongD != null && lost != null && depth > wrongD - lost)
+            cls += ' ep-ply-wrong';
+        }
+      } else if (isFuture) {
+        cls += ' ep-ply-future';
+        cls += ours ? ' ep-ply-us' : ' ep-ply-them';
+      } else {
+        // current ply — left border only
+        cls += ' ep-ply-current';
+        cls += ours ? ' ep-ply-us' : ' ep-ply-them';
+      }
+
+      const actual = isHistory ? (g.fullMoves[col] ?? null) : null;
+      const rawPred  = (_sanGrid[depth] || {})[col] ?? mv;
+      const tip      = _describeMove(rawPred) || sanDisplay;
+      plyCells += `<td class="${cls}" data-ep-tip="${App.esc(tip)}">${App.esc(sanDisplay)}</td>`;
+    }
+
+    const { evalStr = '\u2013', evalColor = 'var(--muted)', nodesStr = '\u2013', seldepth = '\u2013' } = stats;
+    return plyCells +
+      `<td class="ep-td-frozen ep-td-d">${depth}</td>` +
+      `<td class="ep-td-frozen ep-td-sel">${seldepth}</td>` +
+      `<td class="ep-td-frozen ep-td-eval" style="color:${evalColor}">${evalStr}</td>` +
+      `<td class="ep-td-frozen ep-td-nodes">${nodesStr}</td>`;
+  }
+
+  /** Compute SAN list for all committed history moves (once per redraw). */
+  function _buildHistorySan(g) {
+    if (!g.fullMoves?.length || typeof San === 'undefined') return [];
+    return San.buildSanList(g.initialFen, g.fullMoves);
+  }
+
+  /**
+   * Grow the rendered column count.  Only ever increases.
+   * Appends new <th> cells to both header rows + updates colgroup + rebuilds body rows.
+   */
+  function _expandCols(needed) {
+    if (needed <= _numPlyCols) return;
+    const g        = App.currentGame();
+    const prevCols = _numPlyCols;
+    _numPlyCols    = needed;
+
+    // Grow the colgroup span
+    const colEl = document.getElementById('ep-col-ply-group');
+    if (colEl) colEl.setAttribute('span', _numPlyCols);
+
+    // Append new <th> cells to the single header row
+    const plyRow = document.getElementById('ep-thead-ply');
+    if (plyRow && g) {
+      // Insert before the first frozen th
+      const frozenAnchor = plyRow.querySelector('.ep-th-frozen');
+      for (let col = prevCols; col < needed; col++) {
+        const isOurs = _isOurs(g, col);
+        const side   = isOurs ? 'bot' : 'opp';
+        const pc     = (col % 2 === 0) ? 'w' : 'b';
+        const th = document.createElement('th');
+        th.className      = `ep-th-ply ep-th-ply-${side} ep-pc-${pc}`;
+        th.dataset.plyCol = col;
+        th.innerHTML      = `<span class="ep-ply-dot"></span>${col + 1}`;
+        plyRow.insertBefore(th, frozenAnchor ?? null);
+      }
+    }
+
+    // Rebuild all existing body rows at the new width
+    const tbody = document.getElementById('ep-tbody');
+    if (!tbody || !g) return;
+    const historySan2 = _buildHistorySan(g);
+    for (const tr of tbody.querySelectorAll('tr[data-depth]')) {
+      tr.innerHTML = _buildRowCells(g, +tr.dataset.depth, historySan2);
+    }
+    _updateFrozenOffsets();
+  }
+
+  /** Ensure a <tr> exists for the given depth, inserted in sorted order. */
+  function _ensureRow(tbody, depth) {
+    if (tbody.querySelector(`tr[data-depth="${depth}"]`)) return;
+    const tr = document.createElement('tr');
+    tr.dataset.depth = depth;
+    let placed = false;
+    for (const ex of tbody.querySelectorAll('tr[data-depth]')) {
+      if (+ex.dataset.depth > depth) { tbody.insertBefore(tr, ex); placed = true; break; }
+    }
+    if (!placed) tbody.appendChild(tr);
+  }
+
+  /** Rebuild every row's cells in-place. Creates rows for any grid depth missing a <tr>. */
+  function _redrawAllRows(g) {
+    const tbody = document.getElementById('ep-tbody');
+    if (!tbody || !g) return;
+    const gPly = g.fullMoves?.length ?? 0;
+    _expandCols(_neededCols(gPly));
+    for (const d of Object.keys(_pvGrid)) _ensureRow(tbody, +d);
+    // Ensure a row exists one below each column's deepest prediction so the
+    // actual-move cell has a <tr> to render into.
+    for (const col of Object.keys(_actualGrid)) {
+      const maxD = _maxDepthForCol(+col);
+      if (maxD >= 0) _ensureRow(tbody, maxD + 1);
+    }
+    const historySan = _buildHistorySan(g);
+    for (const tr of tbody.querySelectorAll('tr[data-depth]')) {
+      tr.innerHTML = _buildRowCells(g, +tr.dataset.depth, historySan);
+    }
+    _updateFrozenOffsets();
+  }
+
+  /**
+   * Schedule a redraw via requestAnimationFrame — coalesces many rapid calls
+   * (e.g. a burst of search_info events) into a single DOM update per frame.
+   */
+  function _scheduleRedraw() {
+    if (_rafId != null) return; // already pending
+    _rafId = requestAnimationFrame(() => {
+      _rafId = null;
+      const g = App.currentGame();
+      if (g && _rendered) _redrawAllRows(g);
+    });
+  }
+
+  /** Erase all grid entries at columns >= startCol (stale future predictions). */
+  function _wipeFuture(startCol) {
+    let wiped = 0;
+    _mdCache = null; // invalidate cache
+    for (const cols of Object.values(_pvGrid))
+      for (const c of Object.keys(cols))
+        if (+c >= startCol) { delete cols[+c]; wiped++; }
+    for (const cols of Object.values(_sanGrid))
+      for (const c of Object.keys(cols))
+        if (+c >= startCol) delete cols[+c];
+    // Clear live (non-frozen) tentative entries for wiped columns
+    for (const c of Object.keys(_actualGrid))
+      if (+c >= startCol && !_actualGrid[+c]?.frozen) delete _actualGrid[+c];
+    if (wiped) _dbg('wipeFuture(>=' + startCol + ') removed ' + wiped + ' cells');
+  }
+
+  /* ── eval display helper ────────────────────────────────────────── */
+
+  function _fmtEval(cp) {
+    const v = cp / 100;
+    return (v >= 0 ? '+' : '') + v.toFixed(2);
+  }
+
+  /**
+   * Continuous eval color — used for stats strip text.
+   * Saturates at ±200cp. Mate gets solid green/red.
+   */
+  function _evalColor(cp, mate) {
+    if (mate != null) return mate > 0 ? 'hsl(142,60%,48%)' : 'hsl(0,65%,58%)';
+    if (cp == null)   return 'var(--muted)';
+    const t = Math.min(1, Math.abs(cp) / 200);
+    if (cp >= 0) {
+      const h = 142, s = Math.round(t * 55), l = Math.round(62 - t * 18);
+      return `hsl(${h},${s}%,${l}%)`;
+    } else {
+      const h = 0, s = Math.round(t * 62), l = Math.round(62 - t * 10);
+      return `hsl(${h},${s}%,${l}%)`;
+    }
+  }
+
+  /**
+   * Tiered eval cell styling for committed actual-move cells.
+   *
+   *  Tier 0 ( |cp| <  30 ): equal       — no style
+   *  Tier 1 ( |cp| <  80 ): slight edge — faint flat tint
+   *  Tier 2 ( |cp| < 180 ): edge        — angled gradient + colored border-top
+   *  Tier 3 ( |cp| < 350 ): advantage   — deeper gradient + glow shadow
+   *  Tier 4 ( |cp| < 600 ): winning     — strong gradient + white text + breathing-glow class
+   *  Tier 5 ( |cp| ≥ 600 ): decisive    — deep gradient + brighter breathing glow
+   *  Mate                 : spinning conic-gradient border via CSS class (ep-eval-mate-*)
+   *
+   * Returns { style: inlineStyleStr, cls: extraCssClass }
+   */
+  /**
+   * @param {number|null} cp       centipawns (from engine's POV)
+   * @param {number|null} mate     mate-in-N
+   * @param {boolean}     frozen   cell is committed (not live)
+   * @param {boolean}     rightward  use left-border + right-direction gradient
+   *                                 (used for the live "thinking" cell in the
+   *                                 current ply column; also renders when !frozen)
+   */
+  function _evalCellStyle(cp, mate, frozen, rightward = false) {
+    // Non-frozen, non-rightward cells have no eval styling.
+    if (!frozen && !rightward) return { style: '', cls: '' };
+
+    if (mate != null) {
+      // Random phase shift so adjacent mate cells don't pulse in lockstep
+      const delay = (Math.random() * 1.8).toFixed(2);
+      return { style: `animation-delay:-${delay}s;`, cls: mate > 0 ? 'ep-eval-mate-win' : 'ep-eval-mate-lose' };
+    }
+    if (cp == null) {
+      // Rightward (thinking cell): still show a neutral left border so the
+      // CSS .ep-ply-actual top inset is overridden and no double-border appears.
+      return rightward
+        ? { style: 'box-shadow:inset 2px 0 0 0 rgba(120,120,140,0.35);', cls: '' }
+        : { style: '', cls: '' };
+    }
+
+    const sign  = cp >= 0 ? 1 : -1;
+    const absCp = Math.abs(cp);
+    const h     = sign > 0 ? 142 : 0;
+
+    if (absCp < 30) {
+      const base = 'background:rgba(160,160,160,0.07);';
+      return { style: rightward ? base + 'box-shadow:inset 2px 0 0 0 rgba(120,120,140,0.35);' : base, cls: '' };
+    }
+
+    let tier, bgA, sat, lit, glowA, spread, whiteText, border;
+    if      (absCp < 80)  { tier=1; bgA=0.07; sat=35; lit=50; glowA=0;    spread=0;  whiteText=false; border=false; }
+    else if (absCp < 180) { tier=2; bgA=0.13; sat=52; lit=42; glowA=0;    spread=0;  whiteText=false; border=true;  }
+    else if (absCp < 350) { tier=3; bgA=0.22; sat=62; lit=36; glowA=0.12; spread=8;  whiteText=false; border=true;  }
+    else if (absCp < 600) { tier=4; bgA=0.38; sat=72; lit=28; glowA=0.22; spread=14; whiteText=true;  border=true;  }
+    else                  { tier=5; bgA=0.55; sat=80; lit=22; glowA=0.35; spread=20; whiteText=true;  border=true;  }
+
+    // Live (rightward) cells are slightly lighter than frozen committed cells
+    const alphaScale = (frozen ? 1.0 : 0.72);
+    const s1 = `hsla(${h},${sat}%,${lit + 10}%,${(bgA * alphaScale).toFixed(2)})`;
+    const s2 = `hsla(${h},${sat}%,${lit}%,${((bgA + 0.10) * alphaScale).toFixed(2)})`;
+    const dir = rightward ? 'to right' : '135deg';
+    let style = `background:linear-gradient(${dir},${s1} 0%,${s2} 100%);`;
+    if (whiteText) style += 'color:rgba(255,255,255,0.92);';
+    // Build combined box-shadow: inset border indicator + optional outer glow.
+    // Using inset shadow avoids border-collapse row-propagation (a real border-top/left on
+    // one cell bleeds its style across the whole row gap in a collapsed table).
+    // For rightward (live thinking cell), always emit a left inset so the CSS
+    // .ep-ply-actual top-inset is fully overridden and only ONE border shows.
+    const shadows = [];
+    if (rightward) {
+      // Always emit left inset for the thinking cell — overrides CSS top inset.
+      const bA = border
+        ? Math.min(0.9, 0.25 + tier * 0.13)
+        : 0.45; // fallback accent-strength for low-tier / equal evals
+      shadows.push(`inset 2px 0 0 0 hsla(${h},70%,55%,${bA.toFixed(2)})`);
+    } else if (border) {
+      const bA = Math.min(0.9, 0.25 + tier * 0.13);
+      shadows.push(`inset 0 2px 0 0 hsla(${h},70%,55%,${bA.toFixed(2)})`);
+    }
+    if (glowA > 0) {
+      const gA = frozen ? glowA : glowA * 0.8;
+      shadows.push(`0 0 ${Math.round(spread / 2)}px hsla(${h},85%,55%,${gA.toFixed(2)})`);
+      shadows.push(`0 0 ${spread}px hsla(${h},75%,45%,${(gA * 0.55).toFixed(2)})`);
+    }
+    if (shadows.length) style += `box-shadow:${shadows.join(',')};`;
+    // Tiers 4-5: static glow only (no animation — mate gets the pulse)
+    const cls = '';
+    return { style, cls };
+  }
+
+  // _colorPv removed — PV moves are now individual <td> cells (ep-td-ply) per column.
+  /* ── frozen column offset manager ───────────────────────────────── */
+
+  /**
+   * Recalculates right: offsets for all frozen cells.
+   * Called after full render and after any column resize.
+   * D and Sel have fixed widths; only Eval and Nodes are user-resizable.
+   */
+  const EP_D_W   = 24;  // px, fixed
+  const EP_SEL_W = 28;  // px, fixed
+
+  function _updateFrozenOffsets() {
+    const evalW  = parseFloat(document.getElementById('ep-col-eval')?.style.width)  || 60;
+    const nodesW = parseFloat(document.getElementById('ep-col-nodes')?.style.width) || 52;
+
+    const rNodes = 0;
+    const rEval  = nodesW;
+    const rSel   = nodesW + evalW;
+    const rD     = nodesW + evalW + EP_SEL_W;
+
+    _setRight('#ep-table-wrap .ep-th-nodes, #ep-table-wrap .ep-td-nodes', rNodes);
+    _setRight('#ep-table-wrap .ep-th-eval,  #ep-table-wrap .ep-td-eval',  rEval);
+    _setRight('#ep-table-wrap .ep-th-sel,   #ep-table-wrap .ep-td-sel',   rSel);
+    _setRight('#ep-table-wrap .ep-th-d,     #ep-table-wrap .ep-td-d',     rD);
+  }
+
+  function _setRight(sel, px) {
+    document.querySelectorAll(sel).forEach(el => { el.style.right = px + 'px'; });
+  }
+  /* ── column resize ─────────────────────────────────────────────── */
+
+  function _bindResizeHandles() {
+    const wrap = document.getElementById('ep-table-wrap');
+    if (!wrap || wrap._epResizeBound) return;
+    wrap._epResizeBound = true;
+
+    wrap.addEventListener('mousedown', e => {
+      const handle = e.target.closest('.ep-col-resize');
+      if (!handle) return;
+      const col = document.getElementById(handle.dataset.col);
+      if (!col) return;
+
+      const th     = handle.parentElement;
+      const startX = e.clientX;
+      const startW = th.getBoundingClientRect().width;
+
+      handle.classList.add('dragging');
+      e.preventDefault();
+
+      const onMove = ev => {
+        const w = Math.max(18, startW + (ev.clientX - startX));
+        col.style.width = w + 'px';
+        _updateFrozenOffsets();
+      };
+      const onUp = () => {
+        handle.classList.remove('dragging');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup',   onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup',   onUp);
+    });
+  }
+
+  /* ── PV hover → board preview (disabled) ────────────────────────── */
+
+  function _bindPvHover() {
+    const wrap = document.getElementById('ep-table-wrap');
+    const tip  = document.getElementById('ep-tip');
+    if (!wrap || !tip) return;
+
+    wrap.addEventListener('mouseover', e => {
+      const td = e.target.closest('td[data-ep-tip]');
+      if (!td) { tip.hidden = true; return; }
+      const text = td.dataset.epTip || '';
+      if (!text) { tip.hidden = true; return; }
+      // Render structured tooltip: tab-separated lines → kv rows, '---' → hr
+      const esc2 = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      let html = '';
+      let firstLine = true;
+      for (const l of text.split('\n')) {
+        if (l === '---') { html += '<div class="ep-tip-hr"></div>'; continue; }
+        const tab = l.indexOf('\t');
+        if (tab !== -1) {
+          html += `<div class="ep-tip-row"><span class="ep-tip-k">${esc2(l.slice(0,tab))}</span>` +
+                  `<span class="ep-tip-v">${esc2(l.slice(tab+1))}</span></div>`;
+        } else if (firstLine) {
+          html += `<div class="ep-tip-move">${esc2(l)}</div>`;
+        } else {
+          html += `<div class="ep-tip-line">${esc2(l)}</div>`;
+        }
+        firstLine = false;
+      }
+      tip.innerHTML = html;
+      tip.hidden = false;
+      // Position below (or above) the cell
+      const ar = td.getBoundingClientRect();
+      const tr = tip.getBoundingClientRect();
+      const vw = window.innerWidth, vh = window.innerHeight;
+      let left = ar.left, top = ar.bottom + 5;
+      if (top + tr.height > vh - 8) top = ar.top - tr.height - 5;
+      if (left + tr.width  > vw - 8) left = vw - tr.width - 8;
+      if (left < 4) left = 4;
+      tip.style.left = left + 'px';
+      tip.style.top  = top  + 'px';
+    });
+
+    wrap.addEventListener('mouseleave', () => { tip.hidden = true; });
+    // Also hide when scrolling so it doesn't stick
+    wrap.addEventListener('scroll', () => { tip.hidden = true; }, { passive: true });
+  }
+
+  /* ── register ───────────────────────────────────────────────────── */
+
+  return { show, onEvent };
+})();

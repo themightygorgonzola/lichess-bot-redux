@@ -1,0 +1,57 @@
+# ── Training data (large binary files, hundreds of GB) ───────────────────────
+data/training/
+data/processed/
+data/pgn/
+data/games/
+
+# ── ML checkpoints ────────────────────────────────────────────────────────────
+ml/checkpoints*/
+archives/training-legacy/checkpoints/
+
+# ── Build artifacts ───────────────────────────────────────────────────────────
+build/
+build_tmp/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ── Bot runtime ───────────────────────────────────────────────────────────────
+bot/node_modules/
+bot/.env
+bot/data/book-cache.json
+bot/data/challenger.db
+bot/data/challenger.db-shm
+bot/data/challenger.db-wal
+bot/data/dash-state.json
+
+# ── Engine binaries (built by make.ps1) ───────────────────────────────────────
+bot/engine/*.exe
+bot/engine/*.dll
+bot/engine/gmon.out
+bot/engine/*-prof.exe
+bot/engine/*.bin
+
+# ── Archives: build snapshots (CMake artifacts, not source) ───────────────────
+archives/build-*/
+
+# ── Reference engine sources (large, third-party) ────────────────────────────
+engines/
+
+# ── Results / experiment outputs ─────────────────────────────────────────────
+results/
+
+# ── Bot runtime logs ──────────────────────────────────────────────────────────
+bot/logs/
+
+# ── Scratch / error output ────────────────────────────────────────────────────
+err.txt
+
+# ── Validation datasets (large) ───────────────────────────────────────────────
+data/val/
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.vscode/settings.json
+*.swp
+.DS_Store
+Thumbs.db

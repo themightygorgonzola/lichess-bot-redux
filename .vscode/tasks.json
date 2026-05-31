@@ -1,0 +1,82 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "redux: build-hce b90",
+			"type": "shell",
+			"command": ".\\make.ps1 build-hce",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "eval_accuracy b90",
+			"type": "shell",
+			"command": "python C:\\MySoftwareFolder\\lichess-bot-redux\\tools\\analysis\\eval_accuracy.py --base C:\\MySoftwareFolder\\lichess-bot-redux\\archives\\build-80\\redux-hce.exe --test C:\\MySoftwareFolder\\lichess-bot-redux\\bot\\engine\\redux-hce.exe --json C:\\MySoftwareFolder\\lichess-bot-redux\\results\\analysis\\eval_accuracy_b90.json",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "sf_guided_tune --help",
+			"type": "shell",
+			"command": "python tools/tune/sf_guided_tune.py --help",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "sf_guided_tune b90",
+			"type": "shell",
+			"command": "python tools/tune/sf_guided_tune.py --depth 10 --sf-depth 15 --iters 5 --output results/analysis/sf_guided_b90.json",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "redux: build-hce b91",
+			"type": "shell",
+			"command": ".\\make.ps1 build-hce",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "eval_accuracy b91",
+			"type": "shell",
+			"command": "python tools/analysis/eval_accuracy.py --base archives/build-80/redux-hce.exe --test bot/engine/redux-hce.exe",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "sf_guided_tune v2",
+			"type": "shell",
+			"command": "python tools/tune/sf_guided_tune.py --depth 12 --sf-depth 20 --iters 5 --rebuild-sf --output results/analysis/sf_guided_v2.json",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "redux: build-hce b92",
+			"type": "shell",
+			"command": ".\\make.ps1 build-hce",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "SeeCaptScale probe",
+			"type": "shell",
+			"command": "python - << 'EOF'\nimport sys, json, time\nsys.path.insert(0, 'tools/tune')\nfrom sf_guided_tune import (\n    load_suite, load_or_build_sf_cache, run_fen_detailed,\n    compute_loss, read_engine_defaults, RESULTS_DIR, format_loss,\n    ENGINE_DEFAULT, SF_DEFAULT, SUITE_DEFAULT\n)\nfrom pathlib import Path\nfrom copy import deepcopy\n\nengine = ENGINE_DEFAULT\ncache_path = RESULTS_DIR / 'analysis' / 'sf_guide_cache.json'\nsuite_path = SUITE_DEFAULT\ndepth = 12\nhash_mb = 64\n\npositions = load_suite(suite_path)\nsf_cache = load_or_build_sf_cache(cache_path, SF_DEFAULT, positions, 20, force_rebuild=False)\n\n# filter to tunable set (mirrors filter_positions)\nwith open(cache_path) as f:\n    cached_data = json.load(f)\ncached = cached_data.get('results', cached_data)\n\ndef evaluate(params):\n    results = []\n    for _, fen in positions:\n        r = run_fen_detailed(engine, fen, depth, params, hash_mb, timeout=120)\n        results.append(r)\n    return compute_loss(results, sf_cache, positions)\n\ndefaults = read_engine_defaults(engine)\n\ncandidates = [40, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 175, 190, 210, 230, 250, 300]\n\nprint(f'\\nSeeCaptScale probe  (d{depth}, b92 defaults, full suite)')\nprint(f'{\"Value\":>8}  {\"Total\":>8}  {\"MvCost\":>8}  {\"EvalErr\":>8}  {\"FartD\":>8}')\nprint('-' * 50)\n\nbest_val, best_loss = None, 1e9\nfor v in candidates:\n    p = deepcopy(defaults)\n    p['SeeCaptScale'] = v\n    t0 = time.time()\n    loss = evaluate(p)\n    marker = ' <--' if loss['total'] < best_loss else ''\n    if loss['total'] < best_loss:\n        best_loss = loss['total']\n        best_val = v\n    print(f'{v:>8}  {loss[\"total\"]:>8.4f}  {loss.get(\"mean_move_cost_cp\",0):>7}cp  {loss.get(\"mean_eval_err_cp\",0):>7}cp  {loss.get(\"mean_fart_delta_cp\",0):>6}cp  ({time.time()-t0:.1f}s){marker}')\n\nprint(f'\\nBest: SeeCaptScale={best_val}  loss={best_loss:.4f}')\nEOF",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "SeeCaptScale probe",
+			"type": "shell",
+			"command": "python tools/tune/_see_probe.py",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "eval_accuracy b92",
+			"type": "shell",
+			"command": "python tools/analysis/eval_accuracy.py --base archives/build-80/redux-hce.exe --test bot/engine/redux-hce.exe",
+			"isBackground": false,
+			"group": "test"
+		}
+	]
+}

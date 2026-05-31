@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "ppm": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:\\MySoftwareFolder\\PersonalProjectManager\\packages\\mcp-server\\index.js"],
+      "cwd": "C:\\MySoftwareFolder\\PersonalProjectManager",
+      "env": {
+        "PPM_CONTROLLER_URL": "http://localhost:7000",
+        "PPM_DB_PATH": "C:\\MySoftwareFolder\\PersonalProjectManager\\packages\\controller\\data\\controller.db",
+        "PPM_ADMIN_KEY": "8f2baff56b9b873edc3cd3624c04c7c00416f6fdd2ac165c99ea621908b0322d"
+      }
+    }
+  }
+}

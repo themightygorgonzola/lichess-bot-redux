@@ -1,0 +1,42 @@
+PS C:\MySoftwareFolder\lichess-bot-redux> .\make.ps1 train -Resume ml/checkpoints_v8/best.pt
+
+> Launching NNUE training
+  Dataset: C:\MySoftwareFolder\lichess-bot-redux\data\processed\mean-alltime-dedup-shuffled.bin
+  Size   : 25.26 GB
+Device: cuda  AMP: True
+Model variant: baseline
+Loss mode: wdl
+Target WDL source: cp
+GPU: NVIDIA GeForce RTX 5080  VRAM: 15.9 GB
+
+  Dataset 25.3 GB — using interleaved loader (K=8, peak RAM ~4 GB)
+Train dataset: 179,720,895 records (23310 MB on disk)  chunks=46  chunk_size=3,947,580  interleave_k=8  megabuf=4096 MB
+Val dataset: 19,737,900 records (2560 MB on disk)  chunks=5  chunk_size=3,947,580  interleave_k=8  megabuf=4096 MB
+Train: 179,720,895  Val: 19,737,900  Batch: 65,536  Train batches/epoch: 2,743  Val batches: 302
+
+NNUE Architecture: HalfKAv2 (40960) -> FT (1536) [SCReLU]
+  -> concat(3072) -> L1(256) -> L2(128) -> L3(64) -> 1  x8 buckets
+
+  Feature Transform:      62,916,096 params  (120.0 MB as int16)
+  L1 (×8 buckets):          6,293,504 params
+  L2 (×8 buckets):              263,168 params
+  L3 (×8 buckets):                66,048 params
+  Output (×8 buckets):                   520 params
+  Total:                  69,540,872 params
+
+Resuming from ml/checkpoints_v8/best.pt
+  Resuming from ml/checkpoints_v8/best.pt  (epoch 8  best mae=602.29cp)
+
+     Ep │    Train Loss │      Val Loss │     MAE │      RMSE │      BCE │        LR │    Time
+  ──────┼───────────────┼───────────────┼─────────┼───────────┼──────────┼───────────┼────────
+      9 │       0.23365 │       0.25622 │   602.4 │     971.8 │  0.70467 │  0.001000 │    460s   0s  
+     10 │       0.23134 │       0.25865 │   602.9 │     980.4 │  0.70952 │  0.001000 │    462s   0s  
+     11 │       0.22929 │       0.26101 │   603.3 │     988.8 │  0.71421 │  0.000999 │    458s   0s  
+     12 │       0.22751 │       0.26278 │   604.0 │     995.4 │  0.71777 │  0.000999 │    458s   0s  
+     13 │       0.22589 │       0.26466 │   604.3 │   1,001.8 │  0.72147 │  0.000999 │    458s   0s  
+     14 │       0.22445 │       0.26587 │   604.8 │   1,006.4 │  0.72391 │  0.000998 │    457s   0s  
+     15 │       0.22318 │       0.26804 │   605.5 │   1,014.2 │  0.72830 │  0.000998 │    458s   0s  
+     16 │       0.22198 │       0.26898 │   605.7 │   1,017.5 │  0.73018 │  0.000997 │    456s   0s  
+     17 │       0.22096 │       0.27066 │   606.9 │   1,023.6 │  0.73352 │  0.000997 │    457s   0s  
+     18 │       0.21997 │       0.27201 │   607.2 │   1,028.8 │  0.73634 │  0.000996 │    458s   0s  
+        └─ [█████████████▓                     ]  1090/2743  loss      0.21716   6.1 b/s  ETA  273s  

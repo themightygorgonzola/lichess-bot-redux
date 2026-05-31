@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>H-035 · Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>♞</text></svg>" />
+  <link rel="stylesheet" href="css/dashboard.css" />
+</head>
+<body>
+
+<!-- ── Top bar ──────────────────────────────────────────────────────────── -->
+<header id="topbar">
+  <div class="topbar-left">
+    <span id="status-dot"></span>
+    <span class="bot-name">H-035</span>
+    <span id="status-label">connecting…</span>
+    <span id="session-stats" class="session-stats"></span>
+    <span id="build-version" class="build-version"></span>
+  </div>
+  <nav id="tabs">
+    <button class="tab active" data-tab="game">Game</button>
+    <button class="tab" data-tab="history">History</button>
+  </nav>
+</header>
+
+<!-- ── Tab panels (only one visible at a time) ─────────────────────────── -->
+<main id="panels">
+  <section id="panel-game"    class="panel active"></section>
+  <section id="panel-history" class="panel"></section>
+</main>
+
+<!-- ── Scripts ─────────────────────────────────────────────────────────── -->
+<script src="js/app.js"></script>
+<script src="js/sound.js"></script>
+<script src="js/board.js"></script>
+<script src="js/chart.js"></script>
+<script src="js/san.js"></script>
+<script src="js/tab-game.js"></script>
+<script src="js/tab-engine-pane.js"></script>
+<script src="js/tab-controls.js"></script>
+<script src="js/tab-seek.js"></script>
+<script src="js/tab-history.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,693 @@
+/**
+ * tab-seek.js — Seek tab: browse / filter online bots, send challenges.
+ *
+ * Layout:
+ *   ┌─[ username search ]──────────────────[ Search ]──[ ↺ Refresh ]─count─┐
+ *   ├─[ Status: Online All ]─[ Speed:… ]─[ Elo min–max in… ]─[ Sort… ↑↓ ]─┤
+ *   ├──────────┬──────────┬──────────┬──────────┬──────────┬────────────────┤
+ *   │ Bot      │ Bullet   │ Blitz    │ Rapid    │ Classical│                │
+ *   ├──────────┼──────────┼──────────┼──────────┼──────────┼────────────────┤
+ *   │ ●maia9   │ 2156     │ 2201     │ 2188     │ —        │ [Challenge]    │
+ *   │          ╞══ inline challenge form (spans all cols) ═══════════════════╡
+ *   │ ●leela…  │ …        │ …        │ …        │ …        │ [Challenge]    │
+ *   └──────────┴──────────┴──────────┴──────────┴──────────┴────────────────┘
+ *
+ * API routes:
+ *   GET  /api/bots?nb=100         – online bots
+ *   GET  /api/bots/user/:username – look up any account
+ *   POST /api/bots/challenge      – send outgoing challenge
+ */
+'use strict';
+
+const TabSeek = (() => {
+  let _bots     = [];    // raw data from API
+  let _expanded = null;  // username with open challenge form
+
+  // Active filter + sort state
+  let _filters = {
+    status:   'online',   // 'online' | 'all'
+    speed:    'all',      // 'all' | 'bullet' | 'blitz' | 'rapid' | 'classical'
+    eloMin:   '',
+    eloMax:   '',
+    eloSpeed: 'blitz',
+    sortBy:   'blitz',     // 'name' | 'bullet' | 'blitz' | 'rapid' | 'classical'
+    sortDir:  'desc',      // 'asc' | 'desc'
+  };
+
+  const panel = () => document.getElementById('comms-pane-seek');
+  // Maps outgoing challengeId → username so we can update status when
+  // Lichess sends back a decline/cancel/game-start event over SSE.
+  const _pendingChallenges  = new Map(); // challengeId → username
+  // Challenges that already resolved (game started / declined / cancelled).
+  // Prevents the HTTP response from overwriting a status the SSE path already set.
+  const _completedChallenges = new Set(); // challengeId
+  // Buffer of game_start events (id → opponentName) that arrived before
+  // challenge_sent was registered — matched once the challenge is confirmed.
+  const _earlyGameStarts = new Map();  // gameId → opponentName
+  /* ─────────────────────────────────────────────────────────────────────────
+     Lifecycle
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  function show() {
+    if (!document.getElementById('seek-input')) {
+      _renderShell();
+    }
+    if (_bots.length === 0) _loadOnline();
+  }
+
+  function onEvent(type, data) {
+    if (type === 'challenge_sent' || type === 'challenge_declined' || type === 'challenge_canceled' || type === 'game_start') {
+      console.log('[seek] onEvent:', type, JSON.stringify(data),
+        '| pending:', JSON.stringify([..._pendingChallenges.entries()]),
+        '| early:', JSON.stringify([..._earlyGameStarts.entries()]),
+        '| completed:', JSON.stringify([..._completedChallenges]));
+    }
+    // Lichess uses the same ID for the challenge and the resulting game, so we
+    // match directly by ID — no username comparison needed, no race.
+    if (type === 'challenge_sent') {
+      if (data.challengeId && data.username) {
+        _pendingChallenges.set(data.challengeId, data.username);
+        setTimeout(() => _pendingChallenges.delete(data.challengeId), 45_000);
+        // If game_start already arrived before us (fast auto-accept), handle it now.
+        if (_earlyGameStarts.has(data.challengeId)) {
+          _earlyGameStarts.delete(data.challengeId);
+          _completedChallenges.add(data.challengeId);
+          _pendingChallenges.delete(data.challengeId);
+          const statusEl = document.getElementById(`cf-status-${data.username}`);
+          if (statusEl) {
+            statusEl.className = 'cf-status ok';
+            statusEl.innerHTML = `\u2713 Game started! <button class="cf-go-game">\u2192 Go to game</button>`;
+            statusEl.querySelector('.cf-go-game').addEventListener('click', () => TabGame.switchCommsTab('chat'));
+          }
+        }
+      }
+      return;
+    }
+
+    if (type === 'challenge_declined') {
+      const uname = _pendingChallenges.get(data.id);
+      const id = data.id;
+      if (uname) {
+        _pendingChallenges.delete(id);
+        _completedChallenges.add(id);
+        _setChallengeStatus(uname, `\u2717 Declined: ${data.reason ?? 'unknown'}`, 'cf-status err', true);
+      }
+      return;
+    }
+
+    if (type === 'challenge_canceled') {
+      const uname = _pendingChallenges.get(data.id);
+      if (uname) {
+        _pendingChallenges.delete(data.id);
+        _completedChallenges.add(data.id);
+        _setChallengeStatus(uname, '\u29b8 No response \u2014 cancelled', 'cf-status', true);
+      }
+      return;
+    }
+
+    if (type === 'game_start') {
+      // data.id is the game ID which equals the challenge ID on Lichess.
+      let uname = _pendingChallenges.get(data.id);
+      let matchedId = data.id;
+      // Fallback: match by opponent username in case IDs differ (shouldn't happen but defensive)
+      if (!uname) {
+        const oppLower = (data.opponentId || data.opponentName || '').toLowerCase().replace(/^bot\s+/i, '');
+        for (const [cid, u] of _pendingChallenges) {
+          if (u.toLowerCase() === oppLower) { uname = u; matchedId = cid; break; }
+        }
+      }
+      if (uname) {
+        _pendingChallenges.delete(matchedId);
+        _completedChallenges.add(matchedId);
+        const statusEl = document.getElementById(`cf-status-${uname}`);
+        if (statusEl) {
+          statusEl.className = 'cf-status ok';
+          statusEl.innerHTML = `\u2713 Game started! <button class="cf-go-game">\u2192 Go to game</button>`;
+          statusEl.querySelector('.cf-go-game').addEventListener('click', () => TabGame.switchCommsTab('chat'));
+        }
+      } else {
+        // challenge_sent hasn't arrived yet (fast auto-accept race).
+        // Buffer this so challenge_sent can pick it up when it arrives.
+        _earlyGameStarts.set(data.id, data.opponentName || data.opponentId || '');
+        setTimeout(() => _earlyGameStarts.delete(data.id), 10_000);
+      }
+    }
+  }
+
+  function _setChallengeStatus(username, text, cls, reenableBtn) {
+    const el = document.getElementById(`cf-status-${username}`);
+    if (el) { el.textContent = text; el.className = cls; }
+    if (reenableBtn) {
+      const btn = document.querySelector(`.challenge-send-btn[data-username="${username}"]`);
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Render: static shell (toolbar + filter bar + list placeholder)
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  function _renderShell() {
+    panel().innerHTML = `
+      <!-- toolbar -->
+      <div class="seek-toolbar">
+        <input type="text" id="seek-input" class="seek-input"
+               placeholder="Search bot by username…" autocomplete="off" spellcheck="false" />
+        <button class="seek-btn" id="seek-btn-search">Search</button>
+        <button class="seek-btn secondary" id="seek-btn-online">\u21ba Refresh</button>
+        <span class="seek-count" id="seek-count"></span>
+      </div>
+
+      <!-- filter bar -->
+      <div class="seek-filters">
+        <div class="seek-filter-group">
+          <span class="seek-filter-label">Status</span>
+          <div class="seek-chips" id="sf-status">
+            <button class="sf-chip active" data-val="online">Online</button>
+            <button class="sf-chip" data-val="all">All</button>
+          </div>
+        </div>
+        <div class="seek-filter-group">
+          <span class="seek-filter-label">Speed</span>
+          <div class="seek-chips" id="sf-speed">
+            <button class="sf-chip active" data-val="all">All</button>
+            <button class="sf-chip bullet" data-val="bullet">Bullet</button>
+            <button class="sf-chip blitz"  data-val="blitz">Blitz</button>
+            <button class="sf-chip rapid"  data-val="rapid">Rapid</button>
+            <button class="sf-chip classical" data-val="classical">Classical</button>
+          </div>
+        </div>
+        <div class="seek-filter-group">
+          <span class="seek-filter-label">Elo</span>
+          <input type="number" id="sf-elo-min" class="sf-elo-input" placeholder="Min" min="0" max="4000" />
+          <span class="sf-elo-sep">\u2013</span>
+          <input type="number" id="sf-elo-max" class="sf-elo-input" placeholder="Max" min="0" max="4000" />
+          <span class="seek-filter-label" style="margin-left:.25rem">in</span>
+          <select id="sf-elo-speed" class="sf-select">
+            <option value="bullet">Bullet</option>
+            <option value="blitz" selected>Blitz</option>
+            <option value="rapid">Rapid</option>
+            <option value="classical">Classical</option>
+          </select>
+        </div>
+        <div class="seek-filter-group" style="margin-left:auto">
+          <span class="seek-filter-label">Sort</span>
+          <select id="sf-sort" class="sf-select">
+            <option value="blitz" selected>Blitz</option>
+            <option value="bullet">Bullet</option>
+            <option value="rapid">Rapid</option>
+            <option value="classical">Classical</option>
+            <option value="name">Name</option>
+          </select>
+          <button class="sf-sort-dir" id="sf-sort-dir" title="Toggle sort direction">\u2193</button>
+        </div>
+      </div>
+
+      <div class="seek-status" id="seek-status"></div>
+      <div id="seek-list"></div>`;
+
+    // Toolbar
+    document.getElementById('seek-btn-search').addEventListener('click', _onSearch);
+    document.getElementById('seek-btn-online').addEventListener('click', _loadOnline);
+    document.getElementById('seek-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') _onSearch();
+    });
+
+    // Status chips
+    document.getElementById('sf-status').addEventListener('click', e => {
+      const btn = e.target.closest('.sf-chip');
+      if (!btn) return;
+      _filters.status = btn.dataset.val;
+      _selectChip('sf-status', btn.dataset.val);
+      _rerender();
+    });
+
+    // Speed chips
+    document.getElementById('sf-speed').addEventListener('click', e => {
+      const btn = e.target.closest('.sf-chip');
+      if (!btn) return;
+      _filters.speed = btn.dataset.val;
+      _selectChip('sf-speed', btn.dataset.val);
+      _rerender();
+    });
+
+    // Elo inputs (debounced)
+    let eloTimer;
+    const eloChange = () => {
+      clearTimeout(eloTimer);
+      eloTimer = setTimeout(() => {
+        _filters.eloMin   = document.getElementById('sf-elo-min')?.value ?? '';
+        _filters.eloMax   = document.getElementById('sf-elo-max')?.value ?? '';
+        _filters.eloSpeed = document.getElementById('sf-elo-speed')?.value ?? 'blitz';
+        _rerender();
+      }, 350);
+    };
+    document.getElementById('sf-elo-min').addEventListener('input', eloChange);
+    document.getElementById('sf-elo-max').addEventListener('input', eloChange);
+    document.getElementById('sf-elo-speed').addEventListener('change', eloChange);
+
+    // Sort
+    document.getElementById('sf-sort').addEventListener('change', e => {
+      _filters.sortBy = e.target.value;
+      _rerender();
+      _updateSortHeader();
+    });
+    document.getElementById('sf-sort-dir').addEventListener('click', () => {
+      _filters.sortDir = _filters.sortDir === 'desc' ? 'asc' : 'desc';
+      const btn = document.getElementById('sf-sort-dir');
+      if (btn) btn.textContent = _filters.sortDir === 'desc' ? '\u2193' : '\u2191';
+      _rerender();
+    });
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Filters + sort (client-side, data already loaded)
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  function _applyFilters() {
+    let result = [..._bots];
+
+    if (_filters.status === 'online') {
+      result = result.filter(b => b.online);
+    }
+    if (_filters.speed !== 'all') {
+      result = result.filter(b => (b.perfs?.[_filters.speed]?.games ?? 0) > 0);
+    }
+
+    const eMin = _filters.eloMin !== '' ? parseInt(_filters.eloMin, 10) : null;
+    const eMax = _filters.eloMax !== '' ? parseInt(_filters.eloMax, 10) : null;
+    if (eMin !== null || eMax !== null) {
+      const sp = _filters.eloSpeed;
+      result = result.filter(b => {
+        const r = b.perfs?.[sp]?.rating;
+        if (r == null) return false;
+        if (eMin !== null && r < eMin) return false;
+        if (eMax !== null && r > eMax) return false;
+        return true;
+      });
+    }
+
+    // Sort
+    const sp = _filters.sortBy;
+    if (sp === 'name') {
+      result.sort((a, b) =>
+        (a.username ?? '').toLowerCase().localeCompare((b.username ?? '').toLowerCase())
+      );
+      if (_filters.sortDir === 'desc') result.reverse();
+    } else {
+      result.sort((a, b) => {
+        const ra = a.perfs?.[sp]?.rating ?? 0;
+        const rb = b.perfs?.[sp]?.rating ?? 0;
+        return _filters.sortDir === 'desc' ? rb - ra : ra - rb;
+      });
+    }
+
+    return result;
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Render: bot table
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  function _rerender() {
+    _expanded = null;
+    _renderBots(_applyFilters());
+  }
+
+  function _renderBots(bots) {
+    const listEl = document.getElementById('seek-list');
+    const cntEl  = document.getElementById('seek-count');
+    if (!listEl) return;
+
+    if (cntEl) {
+      const total = _bots.length;
+      const shown = bots.length;
+      cntEl.textContent = total === shown
+        ? `${total} bot${total !== 1 ? 's' : ''}`
+        : `${shown} of ${total}`;
+    }
+
+    if (bots.length === 0) {
+      listEl.innerHTML = '<div class="empty-state"><div class="icon">\uD83E\uDD16</div>No bots match the current filters.</div>';
+      return;
+    }
+
+    const sortBy = _filters.sortBy;
+    listEl.innerHTML = `
+      <div class="bot-table">
+        <div class="bot-thead">
+          <div class="bot-th bc-name" data-sort="name">Bot</div>
+          <div class="bot-th bc-bullet${sortBy==='bullet'?' sorted':''}" data-sort="bullet">Bullet</div>
+          <div class="bot-th bc-blitz${sortBy==='blitz'?' sorted':''}"  data-sort="blitz">Blitz</div>
+          <div class="bot-th bc-rapid${sortBy==='rapid'?' sorted':''}"  data-sort="rapid">Rapid</div>
+          <div class="bot-th bc-classical${sortBy==='classical'?' sorted':''}" data-sort="classical">Classical</div>
+          <div class="bot-th bc-action"></div>
+        </div>
+        ${bots.map(b => _botBlockHTML(b)).join('')}
+      </div>`;
+
+    // Column header click = sort by that column
+    listEl.querySelector('.bot-thead').addEventListener('click', e => {
+      const th = e.target.closest('.bot-th[data-sort]');
+      if (!th) return;
+      const col = th.dataset.sort;
+      if (_filters.sortBy === col) {
+        _filters.sortDir = _filters.sortDir === 'desc' ? 'asc' : 'desc';
+        const dirBtn = document.getElementById('sf-sort-dir');
+        if (dirBtn) dirBtn.textContent = _filters.sortDir === 'desc' ? '\u2193' : '\u2191';
+      } else {
+        _filters.sortBy = col;
+        _filters.sortDir = col === 'name' ? 'asc' : 'desc';
+        const sortSel = document.getElementById('sf-sort');
+        if (sortSel) sortSel.value = col in {'bullet':1,'blitz':1,'rapid':1,'classical':1,'name':1} ? col : 'blitz';
+        const dirBtn = document.getElementById('sf-sort-dir');
+        if (dirBtn) dirBtn.textContent = _filters.sortDir === 'desc' ? '\u2193' : '\u2191';
+      }
+      _rerender();
+    });
+
+    listEl.querySelectorAll('.challenge-open-btn').forEach(btn => {
+      btn.addEventListener('click', () => _toggleChallenge(btn.dataset.username));
+    });
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Bot block HTML (row + hidden challenge form)
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  function _botBlockHTML(bot) {
+    const uid    = bot.id ?? bot.username ?? '?';
+    const name   = bot.username ?? uid;
+    const online = bot.online  ?? false;
+    const playing= bot.playing ?? null;
+
+    const dot = online
+      ? '<span class="bot-online-dot" title="Online"></span>'
+      : '<span class="bot-offline-dot" title="Offline"></span>';
+    const playBadge = playing
+      ? '<span class="bot-playing-badge">\u25b6 playing</span>'
+      : (!online ? '<span class="bot-offline-label">offline</span>' : '');
+
+    const speeds = ['bullet', 'blitz', 'rapid', 'classical'];
+    const cells  = speeds.map(k => {
+      const p = bot.perfs?.[k];
+      if (!p || !p.games) {
+        return `<div class="bc-cell"><span class="bot-rating-none">&mdash;</span></div>`;
+      }
+      const prov = p.provisional ? '<sup class="bot-rating-prov">?</sup>' : '';
+      const gStr = p.games >= 1000 ? `${(p.games / 1000).toFixed(1)}k` : String(p.games);
+      return `<div class="bc-cell">
+        <span class="bot-rating-val ${k}">${p.rating}${prov}</span>
+        <span class="bot-rating-games">${gStr} games</span>
+      </div>`;
+    }).join('');
+
+    const rowHtml = `
+      <div class="bot-row-grid${online ? ' online' : ''}">
+        <div class="bc-name">
+          <div class="bc-name-top">
+            ${dot}
+            <a class="bot-name" href="https://lichess.org/@/${encodeURIComponent(name)}"
+               target="_blank" rel="noopener noreferrer">${App.esc(name)}</a>
+          </div>
+          <div class="bc-name-sub">${playBadge}</div>
+        </div>
+        ${cells}
+        <div class="bc-action">
+          <button class="challenge-open-btn" data-username="${App.esc(name)}">Challenge</button>
+        </div>
+      </div>`;
+
+    return `<div class="bot-block" id="bot-block-${App.esc(uid)}">${rowHtml}${_challengeFormHTML(name)}</div>`;
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Inline challenge form
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  function _challengeFormHTML(username) {
+    const uid = username;
+    const presets = [
+      { label: '1+0',   limit: 60,  inc: 0,  cls: 'bullet' },
+      { label: '2+1',   limit: 120, inc: 1,  cls: 'bullet' },
+      { label: '3+2',   limit: 180, inc: 2,  cls: 'blitz'  },
+      { label: '5+3',   limit: 300, inc: 3,  cls: 'blitz'  },
+      { label: '10+5',  limit: 600, inc: 5,  cls: 'rapid'  },
+      { label: '15+10', limit: 900, inc: 10, cls: 'rapid'  },
+    ];
+    const presetHTML = presets.map((p, i) =>
+      `<button class="time-preset ${p.cls}${i === 3 ? ' active' : ''}"
+               data-limit="${p.limit}" data-inc="${p.inc}">${p.label}</button>`
+    ).join('');
+
+    return `
+      <div class="challenge-form" id="cform-${App.esc(uid)}" style="display:none">
+        <div class="challenge-form-inner">
+          <div class="cf-row">
+            <span class="cf-label">Time</span>
+            <div class="cf-presets">${presetHTML}</div>
+          </div>
+          <div class="cf-row">
+            <span class="cf-label">Custom</span>
+            <input type="number" id="cf-limit-${App.esc(uid)}" class="cf-num" value="300" min="1" max="10800" title="Clock seconds" />
+            <span class="cf-sep">+</span>
+            <input type="number" id="cf-inc-${App.esc(uid)}"   class="cf-num" value="3"   min="0" max="60"    title="Increment seconds" />
+            <span class="cf-unit">s</span>
+          </div>
+          <div class="cf-row">
+            <span class="cf-label">Rated</span>
+            <div class="cf-toggle on" id="cf-rated-${App.esc(uid)}" title="Toggle rated game"></div>
+            <span class="cf-unit" style="font-size:.7rem;color:var(--muted);margin-left:.25rem"
+                  id="cf-rated-lbl-${App.esc(uid)}">Rated</span>
+          </div>
+          <div class="cf-row">
+            <span class="cf-label">Color</span>
+            <div class="cf-color-btns">
+              <button class="cf-color active" data-color="random">Random</button>
+              <button class="cf-color" data-color="white">White</button>
+              <button class="cf-color" data-color="black">Black</button>
+            </div>
+          </div>
+          <div class="cf-actions">
+            <button class="challenge-cancel-btn" data-username="${App.esc(uid)}">Cancel</button>
+            <button class="challenge-send-btn"   data-username="${App.esc(uid)}">Send Challenge</button>
+          </div>
+          <div class="cf-status" id="cf-status-${App.esc(uid)}"></div>
+        </div>
+      </div>`;
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Challenge form: toggle + bind
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  function _toggleChallenge(username) {
+    const formEl = document.getElementById(`cform-${username}`);
+    if (!formEl) return;
+
+    if (_expanded && _expanded !== username) {
+      const prev = document.getElementById(`cform-${_expanded}`);
+      if (prev) prev.style.display = 'none';
+    }
+
+    if (_expanded === username) {
+      formEl.style.display = 'none';
+      _expanded = null;
+      return;
+    }
+
+    _expanded = username;
+    formEl.style.display = 'block';
+    const uid = username;
+
+    // Time presets
+    formEl.querySelectorAll('.time-preset').forEach(btn => {
+      btn.addEventListener('click', () => {
+        formEl.querySelectorAll('.time-preset').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        const lEl = document.getElementById(`cf-limit-${uid}`);
+        const iEl = document.getElementById(`cf-inc-${uid}`);
+        if (lEl) lEl.value = btn.dataset.limit;
+        if (iEl) iEl.value = btn.dataset.inc;
+      });
+    });
+
+    // Rated toggle
+    const ratedToggle = document.getElementById(`cf-rated-${uid}`);
+    const ratedLbl    = document.getElementById(`cf-rated-lbl-${uid}`);
+    ratedToggle?.addEventListener('click', () => {
+      ratedToggle.classList.toggle('on');
+      if (ratedLbl) ratedLbl.textContent = ratedToggle.classList.contains('on') ? 'Rated' : 'Casual';
+    });
+
+    // Color
+    formEl.querySelectorAll('.cf-color').forEach(btn => {
+      btn.addEventListener('click', () => {
+        formEl.querySelectorAll('.cf-color').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      });
+    });
+
+    formEl.querySelector('.challenge-send-btn')?.addEventListener('click',
+      () => _sendChallenge(uid, formEl));
+    formEl.querySelector('.challenge-cancel-btn')?.addEventListener('click',
+      () => _toggleChallenge(uid));
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Send challenge
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  async function _sendChallenge(username, formEl) {
+    const uid       = username;
+    const timeLimit = parseInt(document.getElementById(`cf-limit-${uid}`)?.value ?? '300', 10);
+    const increment = parseInt(document.getElementById(`cf-inc-${uid}`)?.value   ?? '3',   10);
+    const rated     = document.getElementById(`cf-rated-${uid}`)?.classList.contains('on') ?? true;
+    const color     = formEl.querySelector('.cf-color.active')?.dataset.color ?? 'random';
+
+    const statusEl = document.getElementById(`cf-status-${uid}`);
+    const sendBtn  = formEl.querySelector('.challenge-send-btn');
+    if (sendBtn) sendBtn.disabled = true;
+    if (statusEl) { statusEl.textContent = 'Sending\u2026'; statusEl.className = 'cf-status'; }
+
+    try {
+      const res  = await fetch('/api/bots/challenge', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ username, timeLimit, increment, rated, color }),
+      });
+      const data = await res.json();
+      console.log('[seek] challenge POST response:', res.status, JSON.stringify(data));
+
+      if (res.ok) {
+        const cid = data?.challenge?.id ?? data?.id;
+        if (cid) {
+          // If the game already started (or declined) via SSE before this HTTP
+          // response resolved, the status is already correct — don't overwrite it.
+          if (_completedChallenges.has(cid)) {
+            _completedChallenges.delete(cid);
+            return; // status already set by SSE handler
+          }
+          _pendingChallenges.set(cid, username);
+          setTimeout(() => _pendingChallenges.delete(cid), 45_000);
+          // Handle the ultra-fast race where game_start arrived even before challenge_sent.
+          if (_earlyGameStarts.has(cid)) {
+            _earlyGameStarts.delete(cid);
+            _pendingChallenges.delete(cid);
+            const statusEl = document.getElementById(`cf-status-${username}`);
+            if (statusEl) {
+              statusEl.className = 'cf-status ok';
+              statusEl.innerHTML = `\u2713 Game started! <button class="cf-go-game">\u2192 Go to game</button>`;
+              statusEl.querySelector('.cf-go-game').addEventListener('click', () => TabGame.switchCommsTab('chat'));
+            }
+            return;
+          }
+        }
+        if (statusEl) {
+          statusEl.textContent = '\u23f3 Waiting for response\u2026';
+          statusEl.className = 'cf-status';
+        }
+      } else {
+        const msg = data?.error ?? data?.message ?? `Error ${res.status}`;
+        if (statusEl) { statusEl.textContent = `\u2717 ${msg}`; statusEl.className = 'cf-status err'; }
+        if (sendBtn) sendBtn.disabled = false;
+      }
+    } catch (e) {
+      if (statusEl) { statusEl.textContent = `\u2717 ${e.message}`; statusEl.className = 'cf-status err'; }
+      if (sendBtn) sendBtn.disabled = false;
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Data loading
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  async function _loadOnline() {
+    _setStatus('Loading online bots\u2026');
+    _expanded = null;
+    try {
+      const res = await fetch('/api/bots?nb=1000');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const raw = await res.json();
+      // /api/bot/online doesn't set online:true on the objects — stamp it,
+      // since every bot returned by that endpoint is by definition online.
+      _bots = raw.map(b => ({ ...b, online: true }));
+      _clearStatus();
+      // Restore online filter when loading fresh data
+      _filters.status = 'online';
+      _selectChip('sf-status', 'online');
+      _rerender();
+    } catch (e) {
+      _setStatus(`Failed to load: ${e.message}`, 'err');
+    }
+  }
+
+  async function _onSearch() {
+    const q = (document.getElementById('seek-input')?.value ?? '').trim();
+    if (!q) { _loadOnline(); return; }
+
+    _setStatus(`Searching for \u201c${App.esc(q)}\u201d\u2026`);
+    _expanded = null;
+    try {
+      const res  = await fetch(`/api/bots/user/${encodeURIComponent(q)}`);
+      const data = await res.json();
+
+      if (!res.ok) {
+        _setStatus(`Not found: ${App.esc(q)}`, 'err');
+        _bots = [];
+        _renderBots([]);
+        return;
+      }
+
+      if (data.title !== 'BOT') {
+        _setStatus(`\u201c${App.esc(q)}\u201d is not a BOT account (title: ${data.title ?? 'none'})`, 'err');
+        _bots = [];
+        _renderBots([]);
+        return;
+      }
+
+      _clearStatus();
+      _bots = [data];
+      // When doing a direct search, switch to "All" so offline bots show
+      _filters.status = 'all';
+      _selectChip('sf-status', 'all');
+      _rerender();
+    } catch (e) {
+      _setStatus(`Error: ${e.message}`, 'err');
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     UI helpers
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  function _selectChip(groupId, val) {
+    const grp = document.getElementById(groupId);
+    if (!grp) return;
+    grp.querySelectorAll('.sf-chip').forEach(c => {
+      c.classList.toggle('active', c.dataset.val === val);
+    });
+  }
+
+  function _updateSortHeader() {
+    document.querySelectorAll('.bot-th').forEach(th => {
+      th.classList.toggle('sorted', th.dataset.sort === _filters.sortBy);
+    });
+  }
+
+  function _setStatus(msg, cls = '') {
+    const s = document.getElementById('seek-status');
+    if (s) { s.textContent = msg; s.className = `seek-status${cls ? ' ' + cls : ''}`; }
+  }
+
+  function _clearStatus() {
+    const s = document.getElementById('seek-status');
+    if (s) { s.textContent = ''; s.className = 'seek-status'; }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     Register
+  ──────────────────────────────────────────────────────────────────────────*/
+
+  return { show, onEvent };
+})();
