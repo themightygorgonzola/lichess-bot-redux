@@ -1,0 +1,49 @@
+{
+  "globals": {
+    "data": "data/training_dedup/mean-alltime-dedup.bin",
+    "sample_size": 10000,
+    "sample_seed": 0,
+    "device": "cuda",
+    "target_mae": 0.1,
+    "target_maxerr": 0.1,
+    "max_epochs": 800,
+    "print_every": 200,
+    "history_mode": "full",
+    "speed_batch_sizes": [1024, 4096, 10000],
+    "speed_warmup": 10,
+    "speed_iters": 30,
+    "train_speed_iters": 10
+  },
+  "designs": [
+    {
+      "name": "baseline",
+      "family": "baseline",
+      "variant": "baseline",
+      "status": "candidate"
+    },
+    {
+      "name": "small_relu",
+      "family": "relu",
+      "variant": "small_relu",
+      "status": "candidate"
+    },
+    {
+      "name": "small_gelu",
+      "family": "gelu",
+      "variant": "small_gelu",
+      "status": "candidate"
+    },
+    {
+      "name": "wide_gelu",
+      "family": "gelu",
+      "variant": "wide_gelu",
+      "status": "candidate"
+    },
+    {
+      "name": "huge_gelu",
+      "family": "gelu",
+      "variant": "huge_gelu",
+      "status": "candidate"
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "globals": {
+    "data": "data/training_dedup/mean-alltime-dedup.bin",
+    "sample_size": 10000,
+    "sample_seed": 0,
+    "device": "cuda",
+    "target_mae": 0.1,
+    "target_maxerr": 0.1,
+    "max_epochs": 800,
+    "print_every": 200,
+    "history_mode": "full",
+    "speed_batch_sizes": [1024, 4096, 10000],
+    "speed_warmup": 10,
+    "speed_iters": 30,
+    "train_speed_iters": 10
+  },
+  "designs": [
+    {
+      "name": "baseline_ref",
+      "family": "baseline",
+      "variant": "baseline",
+      "status": "candidate",
+      "lr": 0.01
+    },
+    {
+      "name": "micro_relu_fast",
+      "family": "relu",
+      "variant": "micro_relu",
+      "status": "candidate",
+      "lr": 0.01
+    },
+    {
+      "name": "micro_relu_cool",
+      "family": "relu",
+      "variant": "micro_relu",
+      "status": "candidate",
+      "lr": 0.005
+    },
+    {
+      "name": "tiny_relu_std",
+      "family": "relu",
+      "variant": "tiny_relu",
+      "status": "candidate",
+      "lr": 0.01
+    },
+    {
+      "name": "small_relu_std",
+      "family": "relu",
+      "variant": "small_relu",
+      "status": "candidate",
+      "lr": 0.01
+    },
+    {
+      "name": "small_gelu_std",
+      "family": "gelu",
+      "variant": "small_gelu",
+      "status": "candidate",
+      "lr": 0.01
+    },
+    {
+      "name": "wide_relu_std",
+      "family": "relu",
+      "variant": "wide_relu",
+      "status": "candidate",
+      "lr": 0.01
+    },
+    {
+      "name": "wide_gelu_std",
+      "family": "gelu",
+      "variant": "wide_gelu",
+      "status": "candidate",
+      "lr": 0.01
+    },
+    {
+      "name": "huge_relu_std",
+      "family": "relu",
+      "variant": "huge_relu",
+      "status": "candidate",
+      "lr": 0.01
+    },
+    {
+      "name": "huge_gelu_std",
+      "family": "gelu",
+      "variant": "huge_gelu",
+      "status": "candidate",
+      "lr": 0.01
+    }
+  ]
+}

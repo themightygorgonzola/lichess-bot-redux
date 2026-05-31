@@ -1,0 +1,31 @@
+{
+  "designs": [
+    {
+      "name": "baseline_py",
+      "family": "baseline",
+      "variant": "baseline",
+      "status": "fit-only",
+      "fit_json": "results/arch_bench/baseline_10000_0.json",
+      "search_json": "",
+      "notes": "Example placeholder for the original Python-side baseline."
+    },
+    {
+      "name": "wide_gelu_py",
+      "family": "gelu",
+      "variant": "wide_gelu",
+      "status": "fit-only",
+      "fit_json": "results/arch_bench/wide_gelu_10000_0.json",
+      "search_json": "",
+      "notes": "Example placeholder until exported into the engine."
+    },
+    {
+      "name": "engine_current",
+      "family": "engine",
+      "variant": "current",
+      "status": "engine-exported",
+      "fit_json": "",
+      "search_json": "results/search_bench/core_depth4_default.json",
+      "notes": "Current C++ engine benchmarked on the dedicated core suite."
+    }
+  ]
+}

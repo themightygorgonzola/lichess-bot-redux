@@ -1,0 +1,10 @@
+# Engine binary — built by CMake, not committed
+*.exe
+*.dll
+
+# Profiling artifacts
+gmon.out
+*-prof.exe
+
+# NNUE weights — large binary, keep in repo or distribute separately
+# nn.bin
