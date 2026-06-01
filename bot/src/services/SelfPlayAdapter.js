@@ -510,7 +510,7 @@ const _buildPresets = () => {
       movetime:   maxMovetime,
       threads:    parseInt(process.env.SELFPLAY_BOT_THREADS ?? '4',   10),
       hash:       parseInt(process.env.SELFPLAY_BOT_HASH   ?? '128', 10),
-      ratings:    { bullet: 1600, blitz: 1600, rapid: 1600 },
+      ratings:    { bullet: 1550, blitz: 1600, rapid: 1650 },
       oddsLevels: STANDARD_ODDS,
     },
   ];
