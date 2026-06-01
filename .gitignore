@@ -24,6 +24,7 @@ bot/data/challenger.db
 bot/data/challenger.db-shm
 bot/data/challenger.db-wal
 bot/data/dash-state.json
+bot/version.json
 
 # ── Engine binaries (built by make.ps1) ───────────────────────────────────────
 bot/engine/*.exe
